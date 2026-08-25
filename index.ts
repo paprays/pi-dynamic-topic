@@ -7,6 +7,8 @@ const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const tabId = process.env.HERDR_TAB_ID;
 
+const ENTRY_TYPE_TOPIC = "dynamic-topic-state";
+
 /**
  * 设置终端窗口标题 (OSC 0 / OSC 2)
  */
@@ -88,7 +90,6 @@ function generateFallbackTopic(text: string): string {
 function extractTopicFromXml(text: string): string | null {
   if (!text) return null;
 
-  // 1. 尝试匹配完整的 <topic> 结构
   const topicBlockMatch = text.match(/<topic>([\s\S]*?)<\/topic>/i);
   const targetText = topicBlockMatch ? topicBlockMatch[1] : text;
 
@@ -129,8 +130,8 @@ function stripTopicXmlFromText(text: string): string {
 
 const TOPIC_SYSTEM_PROMPT_INSTRUCTION = `
 
-【会话主题命名要求（CRITICAL）】
-在本次回答的最终文本内容末尾，请另起一行，必须输出以下结构化 XML 标签总结当前会话主题（不要只写在思考/thinking过程中，必须输出在最终回答中）：
+【会话主题命名要求（仅本轮有效）】
+在本次回答的最终文本内容末尾，请另起一行，必须输出以下结构化 XML 标签总结当前会话主题：
 <topic>
   <title>2~6个字的短标题</title>
   <description>10~25个字的任务或问题核心描述</description>
@@ -141,13 +142,22 @@ const TOPIC_SYSTEM_PROMPT_INSTRUCTION = `
 `;
 
 export default function (pi: ExtensionAPI) {
-  let isFirstTurn = false;
   let topicGenerated = false;
   let currentTopic: string | undefined;
+  let shouldInjectInNextPrompt = false;
 
   function applyTopic(topic: string, notify = false, ctx?: ExtensionContext) {
     currentTopic = topic;
     topicGenerated = true;
+    shouldInjectInNextPrompt = false;
+
+    // 持久化到 Session 记录中（自定义 Entry，不参与上下文/Prompt 计算）
+    try {
+      pi.appendEntry(ENTRY_TYPE_TOPIC, { topic });
+    } catch {
+      // ignore
+    }
+
     setTerminalTitle(topic);
     sendHerdrTabRename(topic);
     if (notify && ctx) {
@@ -155,70 +165,70 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  // 1. 会话初始化：检查历史记录
+  // 1. 会话初始化：检查历史持久化记录
   pi.on("session_start", async (_event, ctx) => {
     topicGenerated = false;
     currentTopic = undefined;
-    isFirstTurn = false;
+    shouldInjectInNextPrompt = false;
 
-    const branch = ctx.sessionManager.getBranch();
-    let userMsgCount = 0;
+    const entries = ctx.sessionManager.getEntries();
     let firstUserText = "";
+    let userMsgCount = 0;
 
-    for (const entry of branch) {
-      if (entry.type === "message") {
-        if (entry.message.role === "user") {
-          userMsgCount++;
-          if (!firstUserText) {
-            firstUserText = extractUserText(entry.message.content);
-          }
-        } else if (entry.message.role === "assistant") {
-          // 尝试从历史助手的回答中提取主题
-          if (Array.isArray(entry.message.content)) {
-            for (const part of entry.message.content) {
-              if (part.type === "text" && typeof part.text === "string") {
-                const found = extractTopicFromXml(part.text);
-                if (found) {
-                  applyTopic(found);
-                  break;
-                }
-              }
-            }
-          }
+    for (const entry of entries) {
+      if (entry.type === "custom" && (entry as any).customType === ENTRY_TYPE_TOPIC) {
+        const savedTopic = (entry as any).data?.topic;
+        if (savedTopic) {
+          currentTopic = savedTopic;
+          topicGenerated = true;
+        }
+      } else if (entry.type === "message" && entry.message?.role === "user") {
+        userMsgCount++;
+        if (!firstUserText) {
+          firstUserText = extractUserText(entry.message.content);
         }
       }
     }
 
-    if (userMsgCount === 0) {
-      isFirstTurn = true;
-    } else if (!topicGenerated && firstUserText) {
-      // 如果之前没提取到，则先用 fallback 兜底
-      applyTopic(generateFallbackTopic(firstUserText));
+    if (currentTopic) {
+      setTerminalTitle(currentTopic);
+      sendHerdrTabRename(currentTopic);
+    } else if (userMsgCount === 0) {
+      // 全新会话：准备在第一轮时注入
+      shouldInjectInNextPrompt = true;
+    } else if (firstUserText) {
+      // 有历史对话但未存过 topic，先 fallback 兜底，且不再后续对话中乱注入
+      const fallback = generateFallbackTopic(firstUserText);
+      applyTopic(fallback);
     }
   });
 
-  // 2. 接收用户输入（如果是首条，立刻更新即时标题）
-  pi.on("input", async (event, ctx) => {
+  // 2. 接收用户输入（如果是全新会话的首条输入，先给一个即时预览标题）
+  pi.on("input", async (event, _ctx) => {
     if (event.text && !topicGenerated) {
       const instant = generateFallbackTopic(event.text);
-      applyTopic(instant);
+      currentTopic = instant;
+      setTerminalTitle(instant);
+      sendHerdrTabRename(instant);
+      shouldInjectInNextPrompt = true;
     }
   });
 
-  // 3. 在第一次对话开始前，将结构化 XML 主题总结指令注入到 System Prompt
+  // 3. 严格仅在【第一轮对话】或【compact】触发时注入，之后绝对不注入
   pi.on("before_agent_start", async (event, ctx) => {
     const branch = ctx.sessionManager.getBranch();
     const userMsgCount = branch.filter((e: any) => e.type === "message" && e.message?.role === "user").length;
-    
-    // 如果是第一轮对话，或者尚未成功提取过主题
-    if (userMsgCount <= 1 || !topicGenerated || isFirstTurn) {
+
+    // 只有在真正是第一轮用户提问时才注入指令
+    if (shouldInjectInNextPrompt || (userMsgCount === 1 && !topicGenerated)) {
+      shouldInjectInNextPrompt = false;
       return {
         systemPrompt: event.systemPrompt + "\n\n" + TOPIC_SYSTEM_PROMPT_INSTRUCTION,
       };
     }
   });
 
-  // 4. 当 AI 回复结束时：从 AI 的回复文本中精准解析 <topic><title>...</title><description>...</description></topic>
+  // 4. 当 AI 回复结束时：仅在提取到有效主题时解析并持久化，同时剥离 XML
   pi.on("message_end", async (event, ctx) => {
     if (event.message.role !== "assistant") return;
 
@@ -226,7 +236,6 @@ export default function (pi: ExtensionAPI) {
     let modified = false;
 
     if (Array.isArray(event.message.content)) {
-      // 1. 先检查所有部分（包括 text 和 thinking），优先提取 topic
       for (const part of event.message.content) {
         if ((part.type === "text" || part.type === "thinking") && typeof (part.text || part.thinking) === "string") {
           const raw = part.text || part.thinking || "";
@@ -236,7 +245,6 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // 2. 清理正文中的 XML 标签
       const newContent = event.message.content.map((part: any) => {
         if (part.type === "text" && typeof part.text === "string") {
           const stripped = stripTopicXmlFromText(part.text);
@@ -250,7 +258,6 @@ export default function (pi: ExtensionAPI) {
 
       if (foundTopic) {
         applyTopic(foundTopic, true, ctx);
-        isFirstTurn = false;
       }
 
       if (modified) {
@@ -264,7 +271,7 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // 5. 在 Compact (上下文压缩) 时：在 customInstructions 中要求输出结构化 <topic> 标签
+  // 5. 在 Compact (上下文压缩) 时：向压缩任务追加注入要求
   pi.on("session_before_compact", async (event, _ctx) => {
     const additionalInstruction = `
 请在压缩总结末尾另起一行输出结构化会话主题：
