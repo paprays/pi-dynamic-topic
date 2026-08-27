@@ -1,42 +1,32 @@
 # pi-dynamic-topic
 
-Dynamic conversation topic generator & window/tab title synchronizer extension for [pi-coding-agent](https://github.com/earendil-works/pi-mono).
-
-Automatically extracts concise session topics `[title - description]` via structured XML tags from AI responses (strictly during the first turn and compact phases), updating both terminal window titles (OSC 0/2) and [Herdr](https://herdr.dev) workspace tab labels in real-time.
-
----
+A Pi extension that dynamically generates concise conversation topics on session startup and after compaction, automatically synchronizing them to your terminal title (OSC 0/2) and Herdr tabs.
 
 ## Features
 
-- **Strict Lifecycle Injection**: Only injects topic instructions on the very **first conversation turn** and during `/compact` summaries. Subsequent ordinary conversation turns are never polluted.
-- **Structured XML Extraction**: Uses `<topic><title>...</title><description>...</description></topic>` tags for zero-false-positive recognition.
-- **Silent Tag Stripping**: Seamlessly removes `<topic>` tags from assistant messages, keeping UI transcripts clean.
-- **Session Persistence**: Stores the generated topic in custom Session metadata (`dynamic-topic-state`) to survive restarts and reloads without re-injecting.
-- **Multi-Environment Sync**:
-  - Sets standard terminal window/tab title via ANSI OSC `\x1b]0;...\x07`.
-  - Automatically syncs with **Herdr** tab labels via local IPC Unix socket when running inside Herdr.
-- **Manual Override**: Provides `/topic [title - description]` command to view or manually override the session topic.
+- **Lean & Targeted**: Topic extraction instructions are injected strictly on the first user prompt and immediately after compaction, leaving regular turns clean.
+- **Terminal & Herdr Sync**: Automatically updates terminal title (via OSC escape codes) and syncs Herdr tab label when running in a Herdr environment.
+- **Zero-Pollution Output**: Assistant responses are sanitized to strip internal `<topic>` tags before rendering.
+- **State Locked**: Uses a single-turn expectation lock to prevent false-positive topic parsing during regular code discussion.
+- **Manual Command**: Inspect or override topic at any time via `/topic [name]`.
 
----
-
-## Installation
-
-Place `index.ts` into your global Pi extensions directory:
+## Install
 
 ```bash
-mkdir -p ~/.pi/agent/extensions
-curl -fsSL https://raw.githubusercontent.com/payprays/pi-dynamic-topic/main/index.ts -o ~/.pi/agent/extensions/dynamic-topic.ts
+pi install git:github.com/paprays/pi-dynamic-topic
 ```
 
-Or clone this repository directly:
+## Usage
 
-```bash
-git clone https://github.com/payprays/pi-dynamic-topic.git ~/.pi/agent/extensions/dynamic-topic
-```
+Once installed, the extension works automatically in the background:
 
-Reload extensions inside an active Pi session with `/reload`.
-
----
+- **On session start**: First question sets initial topic and title.
+- **On compaction**: Next question automatically re-summarizes current focus.
+- **Manual override**:
+  ```text
+  /topic
+  /topic FastSort - QuickSort Optimization
+  ```
 
 ## License
 

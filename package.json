@@ -1,0 +1,24 @@
+{
+  "name": "pi-dynamic-topic",
+  "version": "1.0.0",
+  "description": "Pi extension that dynamically summarizes session topics and syncs them to terminal titles and Herdr tabs on startup and post-compaction.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "topic",
+    "dynamic-topic",
+    "herdr",
+    "terminal-title"
+  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "files": [
+    "index.ts"
+  ],
+  "license": "MIT"
+}
