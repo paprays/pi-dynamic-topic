@@ -11,15 +11,17 @@ const ENTRY_TYPE_TOPIC = "dynamic-topic-state";
 
 const TOPIC_USER_PROMPT_INSTRUCTION = `
 
-【会话主题命名要求（仅本轮有效）】
-在本次回答的最终文本内容末尾，请另起一行，必须输出以下结构化 XML 标签总结当前会话主题：
+[Session topic naming rule (this turn ONLY)]
+At the very end of your final answer, on a new line, output a structured XML tag summarizing the current session topic:
 <topic>
-  <title>2~6个字的短标题</title>
-  <description>10~25个字的任务或问题核心描述</description>
+  <title>2-6 Chinese characters, short</title>
+  <description>10-25 Chinese characters, the core task or question</description>
 </topic>
-说明：
-- <title> 提取核心领域或动作（如：Kitty配置、Herdr导航、快速排序等）。
-- <description> 提取具体场景或目标。
+Rules:
+- <title>: extract the core domain or action (e.g. Kitty config, Herdr navigation, quicksort).
+- <description>: extract the specific scenario or goal.
+- Write BOTH fields in Chinese, even though this instruction is in English.
+- This rule applies to this turn only; do not repeat the topic tag in later turns.
 `;
 
 /**
