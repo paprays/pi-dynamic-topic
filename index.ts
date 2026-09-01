@@ -11,7 +11,7 @@ const ENTRY_TYPE_TOPIC = "dynamic-topic-state";
 
 const TOPIC_USER_PROMPT_INSTRUCTION = `
 
-【会话主题命名要求（仅本轮有效）】
+【会话主题命名要求】
 在本次回答的最终文本内容末尾，请另起一行，必须输出以下结构化 XML 标签总结当前会话主题：
 <topic>
   <title>2~6个字的短标题</title>
