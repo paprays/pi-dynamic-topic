@@ -195,6 +195,41 @@ export function loadConfig(cwd: string): DynamicTopicConfig {
 }
 
 /**
+ * 持久化配置文件，优先更新现有配置文件位置或全局位置
+ */
+export function persistConfig(
+    configToSave: DynamicTopicConfig,
+    cwd: string,
+    forceProject = false
+): string {
+    const projectDir = path.join(cwd, ".pi", "extension-settings");
+    const projectPath = path.join(projectDir, "dynamic-topic.json");
+
+    const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+    const globalDir = path.join(agentDir, "extension-settings");
+    const globalPath = path.join(globalDir, "dynamic-topic.json");
+
+    let targetDir = globalDir;
+    let targetPath = globalPath;
+
+    if (forceProject || fs.existsSync(projectPath)) {
+        targetDir = projectDir;
+        targetPath = projectPath;
+    }
+
+    fs.mkdirSync(targetDir, { recursive: true });
+    if (fs.existsSync(targetPath)) {
+        try {
+            fs.copyFileSync(targetPath, `${targetPath}.bak`);
+        } catch {
+            // ignore
+        }
+    }
+    fs.writeFileSync(targetPath, JSON.stringify(configToSave, null, 2), "utf-8");
+    return targetPath;
+}
+
+/**
  * 递归扫描技能文件（深度限制在4层以内以保证性能）
  */
 export function discoverSkills(dirs: string[], depthLimit = 4): Map<string, DiscoveredSkill> {
@@ -431,6 +466,62 @@ Rules:
 }
 
 /**
+ * 解析模式参数支持 --tools, --skills, --desc
+ */
+export function parseModeArgs(rawArgs: string) {
+    let tools: string[] | undefined;
+    let skills: string[] | undefined;
+    let desc: string | undefined;
+
+    let remaining = rawArgs.trim();
+
+    const toolsMatch = remaining.match(/(?:--tools|-t)\s+([^\s-]+(?:\s*,\s*[^\s-]+)*)/i);
+    if (toolsMatch) {
+        tools = toolsMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
+        remaining = remaining.replace(toolsMatch[0], " ");
+    }
+
+    const skillsMatch = remaining.match(/(?:--skills|-s)\s+([^\s-]+(?:\s*,\s*[^\s-]+)*)/i);
+    if (skillsMatch) {
+        skills = skillsMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
+        remaining = remaining.replace(skillsMatch[0], " ");
+    }
+
+    const descMatch = remaining.match(/(?:--desc|-d)\s+["']?([^"'-]+)["']?/i);
+    if (descMatch) {
+        desc = descMatch[1].trim();
+        remaining = remaining.replace(descMatch[0], " ");
+    }
+
+    const parts = remaining.trim().split(/\s+/).filter(Boolean);
+    const name = parts[0]?.toLowerCase();
+    if (!desc && parts.length > 1) {
+        desc = parts.slice(1).join(" ");
+    }
+
+    return { name, desc, tools, skills };
+}
+
+/**
+ * 格式化模式列表展示
+ */
+export function formatModeList(modes: Record<string, any>, currentMode: string): string {
+    const lines = [`📋 可用工作模式列表 (当前生效: ${currentMode}):\n`];
+    for (const [key, val] of Object.entries(modes)) {
+        const isCurrent = key === currentMode ? " [当前激活]" : "";
+        const tools = val.recommendedTools?.length
+            ? val.recommendedTools.join(", ")
+            : "无（仅基础集）";
+        const skills = val.recommendedSkills?.length ? val.recommendedSkills.join(", ") : "无";
+        lines.push(`• [${key}]${isCurrent} ${val.description || "无说明"}`);
+        lines.push(`  └ 推荐工具: ${tools}`);
+        lines.push(`  └ 推荐技能: ${skills}\n`);
+    }
+    lines.push(`💡 提示: 输入 /mode <name> 立即换挡；输入 /mode add|edit|del|list 进行增删改查。`);
+    return lines.join("\n");
+}
+
+/**
  * 结合 AI 模型或启发式规则，自动分析环境并归纳生成模式配置
  */
 export async function synthesizeConfigWithAi(
@@ -510,7 +601,6 @@ export async function synthesizeConfigWithAi(
         },
     };
 
-    // 如果运行在活跃会话环境中且有模型注册器与默认模型，通过大模型进行深度语义归纳
     if (ctx?.modelRegistry && ctx?.model) {
         try {
             const prompt = `你是一个智能工具与技能架构专家。
@@ -844,76 +934,174 @@ export default function (pi: ExtensionAPI) {
         expectingTopic = false;
     });
 
-    // 7. 注册 /topic 与 /mode 命令
-    pi.registerCommand("topic", {
-        description: "查看、切换模式或初始化配置: /topic [init | mode <name> | [标题 - 描述]]",
-        handler: async (args, ctx) => {
-            const trimmed = args.trim();
+    /**
+     * 模式核心调度逻辑（支持 增删改查 与 切换）
+     */
+    async function handleModeOperation(rawArgs: string, ctx: ExtensionContext) {
+        const trimmed = rawArgs.trim();
+        const parts = trimmed.split(/\s+/);
+        const subCmd = parts[0]?.toLowerCase();
+        const rest = parts.slice(1).join(" ").trim();
 
-            // 子命令: /topic init [--project]
-            if (trimmed.startsWith("init")) {
-                const isProject = trimmed.includes("--project");
-                const cwd = process.cwd();
-                refreshDiscoveredSkills(cwd);
+        // 1. 列 (List): /mode list / /mode ls 或无参数
+        if (!trimmed || subCmd === "list" || subCmd === "ls") {
+            ctx.ui.notify(formatModeList(config.modes, currentMode), "info");
+            return;
+        }
 
-                ctx.ui.notify("🔍 正在扫描环境中的全部工具与技能，并由 AI 智能归纳模式...", "info");
+        // 2. 初始化 (Init): /mode init [--project]
+        if (subCmd === "init") {
+            const isProject = rest.includes("--project");
+            const cwd = process.cwd();
+            refreshDiscoveredSkills(cwd);
 
-                const allTools = pi.getAllTools();
-                const allSkills = Array.from(discoveredSkillsMap.values());
+            ctx.ui.notify("🔍 正在扫描环境中的全部工具与技能，并由 AI 智能归纳模式...", "info");
 
-                // 调用 AI 模型进行多模式归纳
-                const newConfig = await synthesizeConfigWithAi(allTools, allSkills, ctx);
+            const allTools = pi.getAllTools();
+            const allSkills = Array.from(discoveredSkillsMap.values());
 
-                const targetDir = isProject
-                    ? path.join(cwd, ".pi", "extension-settings")
-                    : path.join(
-                          process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),
-                          "extension-settings"
-                      );
-                const targetFile = path.join(targetDir, "dynamic-topic.json");
+            const newConfig = await synthesizeConfigWithAi(allTools, allSkills, ctx);
+            const savedPath = persistConfig(newConfig, cwd, isProject);
+            config = newConfig;
+            const modeKeys = Object.keys(newConfig.modes).join(", ");
+            ctx.ui.notify(
+                `✅ 成功初始化工作模式配置至: ${savedPath}\n可用模式: [${modeKeys}]`,
+                "success"
+            );
+            return;
+        }
 
-                try {
-                    fs.mkdirSync(targetDir, { recursive: true });
-                    if (fs.existsSync(targetFile)) {
-                        fs.copyFileSync(targetFile, `${targetFile}.bak`);
-                    }
-                    fs.writeFileSync(targetFile, JSON.stringify(newConfig, null, 2), "utf-8");
-                    config = newConfig;
-                    const modeKeys = Object.keys(newConfig.modes).join(", ");
-                    ctx.ui.notify(
-                        `✅ AI 成功初始化模式配置至: ${targetFile}\n可用模式: [${modeKeys}]`,
-                        "success"
-                    );
-                } catch (err: any) {
-                    ctx.ui.notify(`❌ 写入配置失败: ${err.message}`, "error");
-                }
+        // 3. 增 (Add): /mode add <name> <描述> [--tools t1,t2] [--skills s1,s2]
+        if (subCmd === "add") {
+            const { name, desc, tools, skills } = parseModeArgs(rest);
+            if (!name) {
+                ctx.ui.notify(
+                    "用法: /mode add <name> <描述> [--tools t1,t2] [--skills s1,s2]",
+                    "warning"
+                );
                 return;
             }
+            if (config.modes[name]) {
+                ctx.ui.notify(`模式 "${name}" 已存在，请使用 /mode edit 修改`, "warning");
+                return;
+            }
+            config.modes[name] = {
+                description: desc || "自定义工作模式",
+                recommendedTools: tools || [],
+                recommendedSkills: skills || [],
+            };
+            const savedPath = persistConfig(config, process.cwd());
+            ctx.ui.notify(`✅ 成功添加模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            return;
+        }
 
-            // 子命令: /topic mode <name>
-            if (trimmed.startsWith("mode")) {
-                const modeName = trimmed.replace(/^mode\s*/, "").trim().toLowerCase();
-                const modeConfig = config.modes[modeName];
-                if (!modeConfig) {
-                    const available = Object.keys(config.modes).join(", ");
-                    ctx.ui.notify(`未知模式: "${modeName}". 可用模式: ${available}`, "warning");
-                    return;
-                }
+        // 4. 删 (Del/Remove): /mode del <name>
+        if (subCmd === "del" || subCmd === "rm" || subCmd === "delete") {
+            const name = rest.trim().toLowerCase();
+            if (!name) {
+                ctx.ui.notify("用法: /mode del <name>", "warning");
+                return;
+            }
+            if (!config.modes[name]) {
+                ctx.ui.notify(`模式 "${name}" 不存在`, "warning");
+                return;
+            }
+            delete config.modes[name];
+            const savedPath = persistConfig(config, process.cwd());
+            if (currentMode === name) {
+                applyTopic(currentTopic || "[常规模式]", "general", [], [], true, ctx);
+            }
+            ctx.ui.notify(`✅ 成功删除模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            return;
+        }
 
+        // 5. 改 (Edit/Modify): /mode edit <name> [新描述] [--tools t1,t2] [--skills s1,s2]
+        if (subCmd === "edit" || subCmd === "set" || subCmd === "modify") {
+            const { name, desc, tools, skills } = parseModeArgs(rest);
+            if (!name) {
+                ctx.ui.notify(
+                    "用法: /mode edit <name> [新描述] [--tools t1,t2] [--skills s1,s2]",
+                    "warning"
+                );
+                return;
+            }
+            const existing = config.modes[name];
+            if (!existing) {
+                ctx.ui.notify(`模式 "${name}" 不存在，可使用 /mode add 创建`, "warning");
+                return;
+            }
+            config.modes[name] = {
+                description: desc !== undefined && desc !== "" ? desc : existing.description,
+                recommendedTools: tools !== undefined ? tools : existing.recommendedTools,
+                recommendedSkills: skills !== undefined ? skills : existing.recommendedSkills,
+            };
+            const savedPath = persistConfig(config, process.cwd());
+            if (currentMode === name) {
                 const allTools = pi.getAllTools().map((t) => t.name);
                 const normalized = normalizeTools(
-                    modeConfig.recommendedTools,
+                    config.modes[name].recommendedTools,
                     allTools,
                     config.customToolAliases
                 );
                 applyTopic(
-                    currentTopic || `[模式切换 - ${modeName}]`,
-                    modeName,
+                    currentTopic || `[模式更新 - ${name}]`,
+                    name,
                     normalized,
-                    modeConfig.recommendedSkills,
+                    config.modes[name].recommendedSkills,
                     true,
                     ctx
                 );
+            }
+            ctx.ui.notify(`✅ 成功修改模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            return;
+        }
+
+        // 6. 切换 (Switch): /mode <name>
+        const modeName = subCmd;
+        const modeConfig = config.modes[modeName];
+        if (!modeConfig) {
+            const available = Object.keys(config.modes).join(", ");
+            ctx.ui.notify(`未知模式: "${modeName}". 可用模式: ${available}`, "warning");
+            return;
+        }
+
+        const allTools = pi.getAllTools().map((t) => t.name);
+        const normalized = normalizeTools(
+            modeConfig.recommendedTools,
+            allTools,
+            config.customToolAliases
+        );
+        applyTopic(
+            currentTopic || `[模式切换 - ${modeName}]`,
+            modeName,
+            normalized,
+            modeConfig.recommendedSkills,
+            true,
+            ctx
+        );
+    }
+
+    // 7. 注册 /mode 与 /topic 命令
+    pi.registerCommand("mode", {
+        description: "模式管理 (增删改列与切换): /mode [list | add | del | edit | init | <name>]",
+        handler: async (args, ctx) => {
+            await handleModeOperation(args, ctx);
+        },
+    });
+
+    pi.registerCommand("topic", {
+        description: "会话主题与模式管理: /topic [init | mode ... | [标题 - 描述]]",
+        handler: async (args, ctx) => {
+            const trimmed = args.trim();
+
+            if (trimmed.startsWith("mode")) {
+                const rest = trimmed.replace(/^mode\s*/, "");
+                await handleModeOperation(rest, ctx);
+                return;
+            }
+
+            if (trimmed.startsWith("init")) {
+                await handleModeOperation(trimmed, ctx);
                 return;
             }
 
@@ -942,32 +1130,6 @@ export default function (pi: ExtensionAPI) {
                 true,
                 ctx
             );
-        },
-    });
-
-    pi.registerCommand("mode", {
-        description: "切换或初始化模式: /mode [code | academic | ppt | ops | general | init]",
-        handler: async (args, ctx) => {
-            const trimmed = args.trim();
-            if (trimmed.startsWith("init")) {
-                const topicCmd = (pi as any).getCommands?.()?.find?.((c: any) => c.name === "topic");
-                if (topicCmd) {
-                    return topicCmd.handler(trimmed, ctx);
-                }
-            }
-
-            if (!trimmed) {
-                const available = Object.entries(config.modes)
-                    .map(([k, v]) => `• ${k}: ${v.description}`)
-                    .join("\n");
-                ctx.ui.notify(`当前模式: ${currentMode}\n可用模式列表:\n${available}`, "info");
-                return;
-            }
-
-            const topicCmd = (pi as any).getCommands?.()?.find?.((c: any) => c.name === "topic");
-            if (topicCmd) {
-                topicCmd.handler(`mode ${trimmed}`, ctx);
-            }
         },
     });
 }

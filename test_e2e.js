@@ -337,7 +337,7 @@ console.log("  ✓ Lifecycle: Turn 2 single-turn isolation passed");
 
 // 7.5 Manual command: /mode
 commands.get("mode").handler("", mockCtx);
-assert.ok(notifiedMessages.some((m) => m.msg.includes("当前模式: code")));
+assert.ok(notifiedMessages.some((m) => m.msg.includes("当前生效: code") || m.msg.includes("当前模式: code")));
 console.log("  ✓ Command: /mode info query passed");
 
 // 7.6 Manual mode switch: /mode ops
@@ -371,6 +371,30 @@ try {
 commands.get("mode").handler("ppt", mockCtx);
 assert.ok(activeTools.includes("generate_image"), "generate_image must be active in ppt mode");
 assert.ok(activeTools.includes("fetch_content"), "fetch_content must be active in ppt mode");
-console.log("  ✓ Command: /mode ppt dynamic switch passed");
+// 7.9 /mode list
+await commands.get("mode").handler("list", mockCtx);
+assert.ok(notifiedMessages.some((m) => m.msg.includes("可用工作模式列表")));
+console.log("  ✓ Command: /mode list passed");
+
+// 7.10 /mode add
+await commands.get("mode").handler("add review 代码安全审计与重构 --tools ast_search --skills ponytail-review", mockCtx);
+assert.ok(notifiedMessages.some((m) => m.msg.includes("成功添加模式 [review]")));
+assert.ok(notifiedMessages.some((m) => m.level === "success"));
+
+// Switch to the newly added mode
+await commands.get("mode").handler("review", mockCtx);
+assert.ok(activeTools.includes("ast_search"), "ast_search should be activated in review mode");
+console.log("  ✓ Command: /mode add & switch passed");
+
+// 7.11 /mode edit
+await commands.get("mode").handler("edit review 深度代码安全审查 --tools ast_search,nu", mockCtx);
+assert.ok(notifiedMessages.some((m) => m.msg.includes("成功修改模式 [review]")));
+assert.ok(activeTools.includes("nu"), "nu should now be activated after edit");
+console.log("  ✓ Command: /mode edit passed");
+
+// 7.12 /mode del
+await commands.get("mode").handler("del review", mockCtx);
+assert.ok(notifiedMessages.some((m) => m.msg.includes("成功删除模式 [review]")));
+console.log("  ✓ Command: /mode del passed");
 
 console.log("\n🎉 ALL 7 TEST SUITES PASSED FLAWLESSLY! 100% E2E VERIFIED.");
