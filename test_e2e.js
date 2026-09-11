@@ -14,6 +14,10 @@ import {
     DEFAULT_CONFIG,
 } from "./index.ts";
 
+// Isolate tests from real user environment
+const testAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-test-"));
+process.env.PI_CODING_AGENT_DIR = testAgentDir;
+
 console.log("🚀 Starting End-to-End & Unit Test Suite for Pi Dynamic Topic & Capability Router...");
 
 // ==========================================
@@ -396,5 +400,7 @@ console.log("  ✓ Command: /mode edit passed");
 await commands.get("mode").handler("del review", mockCtx);
 assert.ok(notifiedMessages.some((m) => m.msg.includes("成功删除模式 [review]")));
 console.log("  ✓ Command: /mode del passed");
+
+fs.rmSync(testAgentDir, { recursive: true, force: true });
 
 console.log("\n🎉 ALL 7 TEST SUITES PASSED FLAWLESSLY! 100% E2E VERIFIED.");
