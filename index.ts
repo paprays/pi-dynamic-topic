@@ -53,6 +53,11 @@ export const DEFAULT_CONFIG: DynamicTopicConfig = {
             recommendedTools: ["source_check"],
             recommendedSkills: ["academic-paper", "academic-paper-reviewer", "academic-pipeline", "deep-research"],
         },
+        ppt: {
+            description: "PPT与幻灯片制作、大纲策划、视觉插图与排版设计",
+            recommendedTools: ["generate_image", "fetch_content", "web_search"],
+            recommendedSkills: ["browser-act"],
+        },
         ops: {
             description: "系统管理、网络与自动化运维",
             recommendedTools: ["interactive_shell", "nu"],
@@ -69,6 +74,7 @@ export const DEFAULT_CONFIG: DynamicTopicConfig = {
         lsp: "lsp_diagnostics",
         ast: "ast_search",
         shell: "interactive_shell",
+        image: "generate_image",
     },
 };
 
@@ -270,7 +276,6 @@ export function parseTopicXml(text: string): ParsedTopicBlock | null {
             for (let i = 0; i < nodes.length; i++) {
                 const val = nodes[i].textContent?.trim();
                 if (val) {
-                    // 支持逗号或空格分割
                     for (const sub of val.split(/[\s,]+/)) {
                         if (sub.trim()) results.push(sub.trim());
                     }
@@ -407,7 +412,7 @@ At the very end of your final answer, on a new line, output:
 <topic>
   <title>2-6 Chinese characters, short</title>
   <description>10-25 Chinese characters, the core task or question</description>
-  <mode>code | academic | ops | general | custom</mode>
+  <mode>code | academic | ppt | ops | general | custom</mode>
   <tools>
     <tool>tool_name</tool>
   </tools>
@@ -417,12 +422,182 @@ At the very end of your final answer, on a new line, output:
 </topic>
 Rules:
 - <title> & <description>: summarize current session in Chinese.
-- <mode>: broad intent category for mental focus.
-- <tools> & <skills>: freely choose ANY tools and skills you need from the full available list below. You can freely mix tools across domains (e.g. choose academic skills in code mode).
+- <mode>: broad intent category for mental focus (e.g. code, academic, ppt, ops, general).
+- <tools> & <skills>: freely choose ANY tools and skills you need from the full available list below. You can freely mix tools across domains.
 - Available Tools Pool: [${availableTools.join(", ")}]
 - Available Skills Pool: [${availableSkills.join(", ")}]
 - This rule applies to this turn only; do not repeat it in later turns.
 `;
+}
+
+/**
+ * 结合 AI 模型或启发式规则，自动分析环境并归纳生成模式配置
+ */
+export async function synthesizeConfigWithAi(
+    allTools: { name: string; description?: string }[],
+    allSkills: { name: string; description?: string }[],
+    ctx?: ExtensionContext
+): Promise<DynamicTopicConfig> {
+    const baseTools = [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "web_search",
+        "ask_user",
+        "fetch_content",
+        "get_search_content",
+    ];
+
+    const nonBaseTools = allTools.filter((t) => !baseTools.includes(t.name));
+
+    // 默认启发式基准模式
+    const heuristicConfig: DynamicTopicConfig = {
+        version: 1,
+        baseTools,
+        modes: {
+            code: {
+                description: "编程开发、代码分析、排错与底层调试",
+                recommendedTools: nonBaseTools
+                    .filter((t) => /gdb|lsp|ast|nu|interactive_shell|diff|edit|write/i.test(t.name))
+                    .map((t) => t.name),
+                recommendedSkills: allSkills
+                    .filter((s) => /ponytail|karpathy|code|git|dev|audit/i.test(s.name))
+                    .map((s) => s.name),
+            },
+            academic: {
+                description: "学术研究、论文阅读/写作与文献调研",
+                recommendedTools: nonBaseTools
+                    .filter((t) => /source_check|search|paper|arxiv|bib/i.test(t.name))
+                    .map((t) => t.name),
+                recommendedSkills: allSkills
+                    .filter((s) => /academic|paper|research|thesis|pipeline/i.test(s.name))
+                    .map((s) => s.name),
+            },
+            ppt: {
+                description: "PPT与幻灯片制作、大纲策划、视觉插图与排版设计",
+                recommendedTools: nonBaseTools
+                    .filter((t) => /image|generate|fetch|draw|canvas|media/i.test(t.name))
+                    .map((t) => t.name),
+                recommendedSkills: allSkills
+                    .filter((s) => /browser|ppt|slide|present|design/i.test(s.name))
+                    .map((s) => s.name),
+            },
+            ops: {
+                description: "系统管理、网络与自动化运维",
+                recommendedTools: nonBaseTools
+                    .filter((t) => /interactive_shell|nu|bash|ssh|docker|k8s/i.test(t.name))
+                    .map((t) => t.name),
+                recommendedSkills: allSkills
+                    .filter((s) => /ctf|ops|network|sys|orchestrator/i.test(s.name))
+                    .map((s) => s.name),
+            },
+            general: {
+                description: "日常问答、文档撰写、资料收集与轻量交互",
+                recommendedTools: [],
+                recommendedSkills: [],
+            },
+        },
+        customToolAliases: {
+            gdb: allTools.find((t) => t.name.includes("gdb"))?.name || "gdb-mcp_open",
+            lsp: allTools.find((t) => t.name.includes("lsp"))?.name || "lsp_diagnostics",
+            ast: allTools.find((t) => t.name.includes("ast"))?.name || "ast_search",
+            shell: allTools.find((t) => t.name.includes("interactive"))?.name || "interactive_shell",
+            image: allTools.find((t) => t.name.includes("image"))?.name || "generate_image",
+        },
+    };
+
+    // 如果运行在活跃会话环境中且有模型注册器与默认模型，通过大模型进行深度语义归纳
+    if (ctx?.modelRegistry && ctx?.model) {
+        try {
+            const prompt = `你是一个智能工具与技能架构专家。
+请分析当前环境中已安装的全部工具（Tools）和技能（Skills）：
+
+【工具列表】
+${allTools.map((t) => `- ${t.name}: ${t.description || "无说明"}`).join("\n")}
+
+【技能列表】
+${allSkills.map((s) => `- ${s.name}: ${s.description || "无说明"}`).join("\n")}
+
+任务要求：
+1. 深入分析它们的能力，为用户将这些能力归纳组织成多种实用的工作模式。
+2. 必须包含且充实以下标准模式（可根据工具/技能特色补充更多特色模式）：
+   - code: 编程开发、代码分析、排错与底层调试
+   - academic: 学术研究、论文阅读/写作与文献调研
+   - ppt: PPT与幻灯片制作、大纲策划、视觉插图与排版设计
+   - ops: 系统管理、网络与自动化运维
+   - general: 日常问答、文档撰写、资料收集与轻量交互
+3. 为每个模式提供：
+   - description: 简明的中文定位说明
+   - recommendedTools: 该模式推荐激活的额外工具列表（只能从上述工具列表中选择真实存在的工具名）
+   - recommendedSkills: 该模式推荐激活的专业技能列表（只能从上述技能列表中选择真实存在的技能名）
+4. 提供常用的别名字典 customToolAliases（如 gdb, lsp, ast, shell, image 等）。
+5. 必须严格只返回合法的 JSON 对象，不要添加任何 markdown 代码块以外的闲聊文字：
+{
+  "modes": {
+    "code": {
+      "description": "...",
+      "recommendedTools": [...],
+      "recommendedSkills": [...]
+    },
+    "academic": { ... },
+    "ppt": { ... },
+    "ops": { ... },
+    "general": { ... }
+  },
+  "customToolAliases": {
+    "gdb": "...",
+    "lsp": "...",
+    "image": "..."
+  }
+}`;
+
+            const response = await ctx.modelRegistry.complete(
+                ctx.model,
+                {
+                    systemPrompt: "你是一个专业的系统配置生成器，只输出严格合法的 JSON 对象。",
+                    messages: [
+                        {
+                            role: "user",
+                            content: [{ type: "text", text: prompt }],
+                            timestamp: Date.now(),
+                        },
+                    ],
+                }
+            );
+
+            const contentText = response.content
+                .filter((c: any) => c.type === "text")
+                .map((c: any) => c.text)
+                .join("\n");
+
+            const jsonMatch = contentText.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                const parsed = JSON.parse(jsonMatch[0]);
+                if (parsed.modes && typeof parsed.modes === "object") {
+                    return {
+                        version: 1,
+                        baseTools,
+                        modes: {
+                            ...heuristicConfig.modes,
+                            ...parsed.modes,
+                        },
+                        customToolAliases: {
+                            ...heuristicConfig.customToolAliases,
+                            ...(parsed.customToolAliases || {}),
+                        },
+                    };
+                }
+            }
+        } catch {
+            // AI 请求失败或被取消时安全回退至启发式生成
+        }
+    }
+
+    return heuristicConfig;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -455,7 +630,6 @@ export default function (pi: ExtensionAPI) {
             if (entry) {
                 try {
                     const content = fs.readFileSync(entry.filePath, "utf-8");
-                    // 剥离 frontmatter
                     const clean = content.replace(/^---\r?\n[\s\S]*?\r?\n---/, "").trim();
                     instructions.push(`### Skill: ${entry.name}\n${clean}`);
                 } catch {
@@ -498,7 +672,7 @@ export default function (pi: ExtensionAPI) {
         setTerminalTitle(topic);
         sendHerdrTabRename(topic);
 
-        if (notify && ctx) {
+        if (notify && ctx?.ui) {
             ctx.ui.notify(
                 `🎯 [${currentMode}] ${topic}\n激活工具: ${tools.join(", ") || "基础集"} | 技能: ${skills.join(", ") || "无"}`,
                 "info"
@@ -536,7 +710,6 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (savedState?.topic) {
-            // 恢复历史能力状态
             applyTopic(
                 savedState.topic,
                 savedState.mode || "general",
@@ -546,11 +719,9 @@ export default function (pi: ExtensionAPI) {
                 ctx
             );
         } else if (userMsgCount === 0) {
-            // 全新冷启动：仅激活 baseTools，并标记首轮注入
             pi.setActiveTools(config.baseTools);
             shouldInjectInNextPrompt = true;
         } else {
-            // 有对话但未保存过状态：兜底生成
             const fallback = generateFallbackTopic(firstUserText);
             applyTopic(fallback, "general", [], [], false, ctx);
         }
@@ -567,13 +738,12 @@ export default function (pi: ExtensionAPI) {
 
         if (shouldInjectInNextPrompt) {
             shouldInjectInNextPrompt = false;
-            expectingTopic = true; // 开启状态锁
+            expectingTopic = true;
 
             const preview = generateFallbackTopic(event.text);
             setTerminalTitle(preview);
             sendHerdrTabRename(preview);
 
-            // 获取全部注册工具与发现的全部技能
             const allTools = pi.getAllTools().map((t) => t.name);
             const nonBaseTools = allTools.filter((t) => !config.baseTools.includes(t));
             const availableSkills = Array.from(discoveredSkillsMap.values()).map((s) => s.name);
@@ -596,7 +766,6 @@ export default function (pi: ExtensionAPI) {
     pi.on("before_agent_start", async (event) => {
         let systemPrompt = filterSystemPromptSkills(event.systemPrompt, activeSkills);
 
-        // 如果有激活技能的详细说明，追加到系统提示词尾部
         if (activeSkillInstructions.length > 0) {
             systemPrompt = `${systemPrompt}\n\n## Activated Skills Instructions\n${activeSkillInstructions.join("\n\n")}`;
         }
@@ -636,7 +805,7 @@ export default function (pi: ExtensionAPI) {
             });
 
             if (parsedBlock) {
-                expectingTopic = false; // 成功捕获，立即解锁
+                expectingTopic = false;
 
                 const allRegisteredTools = pi.getAllTools().map((t) => t.name);
                 const normalizedTools = normalizeTools(
@@ -687,54 +856,13 @@ export default function (pi: ExtensionAPI) {
                 const cwd = process.cwd();
                 refreshDiscoveredSkills(cwd);
 
-                const allTools = pi.getAllTools().map((t) => t.name);
-                const allSkills = Array.from(discoveredSkillsMap.values()).map((s) => s.name);
+                ctx.ui.notify("🔍 正在扫描环境中的全部工具与技能，并由 AI 智能归纳模式...", "info");
 
-                // 启发式分类模式
-                const newConfig: DynamicTopicConfig = {
-                    version: 1,
-                    baseTools: config.baseTools,
-                    modes: {
-                        code: {
-                            description: "编程开发、代码分析、排错与底层调试",
-                            recommendedTools: allTools.filter((t) =>
-                                /gdb|lsp|ast|nu|interactive_shell|diff|edit|write/i.test(t)
-                            ),
-                            recommendedSkills: allSkills.filter((s) =>
-                                /ponytail|karpathy|code|git|dev|audit/i.test(s)
-                            ),
-                        },
-                        academic: {
-                            description: "学术研究、论文阅读/写作与文献调研",
-                            recommendedTools: allTools.filter((t) =>
-                                /source_check|search|fetch|paper/i.test(t)
-                            ),
-                            recommendedSkills: allSkills.filter((s) =>
-                                /academic|paper|research|thesis|pipeline/i.test(s)
-                            ),
-                        },
-                        ops: {
-                            description: "系统管理、网络与自动化运维",
-                            recommendedTools: allTools.filter((t) =>
-                                /interactive_shell|nu|bash|ssh|docker|k8s/i.test(t)
-                            ),
-                            recommendedSkills: allSkills.filter((s) =>
-                                /ctf|ops|network|sys|orchestrator/i.test(s)
-                            ),
-                        },
-                        general: {
-                            description: "日常问答、文档撰写、资料收集与轻量交互",
-                            recommendedTools: [],
-                            recommendedSkills: [],
-                        },
-                    },
-                    customToolAliases: {
-                        gdb: allTools.find((t) => t.includes("gdb")) || "gdb-mcp_open",
-                        lsp: allTools.find((t) => t.includes("lsp")) || "lsp_diagnostics",
-                        ast: allTools.find((t) => t.includes("ast")) || "ast_search",
-                        shell: allTools.find((t) => t.includes("interactive")) || "interactive_shell",
-                    },
-                };
+                const allTools = pi.getAllTools();
+                const allSkills = Array.from(discoveredSkillsMap.values());
+
+                // 调用 AI 模型进行多模式归纳
+                const newConfig = await synthesizeConfigWithAi(allTools, allSkills, ctx);
 
                 const targetDir = isProject
                     ? path.join(cwd, ".pi", "extension-settings")
@@ -751,7 +879,11 @@ export default function (pi: ExtensionAPI) {
                     }
                     fs.writeFileSync(targetFile, JSON.stringify(newConfig, null, 2), "utf-8");
                     config = newConfig;
-                    ctx.ui.notify(`✅ 成功初始化配置至: ${targetFile}`, "success");
+                    const modeKeys = Object.keys(newConfig.modes).join(", ");
+                    ctx.ui.notify(
+                        `✅ AI 成功初始化模式配置至: ${targetFile}\n可用模式: [${modeKeys}]`,
+                        "success"
+                    );
                 } catch (err: any) {
                     ctx.ui.notify(`❌ 写入配置失败: ${err.message}`, "error");
                 }
@@ -814,19 +946,27 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.registerCommand("mode", {
-        description: "切换或查看模式: /mode [code | academic | ops | general]",
+        description: "切换或初始化模式: /mode [code | academic | ppt | ops | general | init]",
         handler: async (args, ctx) => {
-            if (!args.trim()) {
+            const trimmed = args.trim();
+            if (trimmed.startsWith("init")) {
+                const topicCmd = (pi as any).getCommands?.()?.find?.((c: any) => c.name === "topic");
+                if (topicCmd) {
+                    return topicCmd.handler(trimmed, ctx);
+                }
+            }
+
+            if (!trimmed) {
                 const available = Object.entries(config.modes)
                     .map(([k, v]) => `• ${k}: ${v.description}`)
                     .join("\n");
                 ctx.ui.notify(`当前模式: ${currentMode}\n可用模式列表:\n${available}`, "info");
                 return;
             }
-            // 代理到 /topic mode
+
             const topicCmd = (pi as any).getCommands?.()?.find?.((c: any) => c.name === "topic");
             if (topicCmd) {
-                topicCmd.handler(`mode ${args.trim()}`, ctx);
+                topicCmd.handler(`mode ${trimmed}`, ctx);
             }
         },
     });

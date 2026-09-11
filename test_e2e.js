@@ -231,6 +231,7 @@ const mockPi = {
         { name: "ast_search" },
         { name: "nu" },
         { name: "interactive_shell" },
+        { name: "generate_image" },
     ],
     getActiveTools: () => activeTools,
     setActiveTools: (tools) => {
@@ -257,6 +258,25 @@ const mockCtx = {
             notifiedMessages.push({ msg, level });
         },
     },
+    model: { id: "test-model" },
+    modelRegistry: {
+        complete: async (_model, _ctx) => ({
+            role: "assistant",
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify({
+                        modes: {
+                            code: { description: "AI code", recommendedTools: ["gdb-mcp_open"], recommendedSkills: ["ponytail"] },
+                            ppt: { description: "AI ppt", recommendedTools: ["generate_image"], recommendedSkills: ["browser-act"] },
+                            custom_ai: { description: "AI custom", recommendedTools: ["interactive_shell"], recommendedSkills: [] },
+                        },
+                        customToolAliases: { gdb: "gdb-mcp_open", image: "generate_image" }
+                    })
+                }
+            ]
+        })
+    }
 };
 
 // Initialize extension
@@ -338,10 +358,19 @@ try {
     assert.ok(parsedInit.modes.code, "Should have code mode");
     assert.ok(parsedInit.modes.academic, "Should have academic mode");
     assert.ok(parsedInit.customToolAliases.gdb, "Should configure gdb alias");
-    console.log("  ✓ Command: /topic init --project passed");
+    assert.ok(parsedInit.modes.ppt, "Should have ppt mode");
+    assert.ok(parsedInit.modes.custom_ai, "Should have AI synthesized custom_ai mode");
+    assert.ok(parsedInit.customToolAliases.image, "Should configure image alias");
+    console.log("  ✓ Command: /topic init --project with AI synthesis passed");
 } finally {
     process.chdir(prevCwd);
     fs.rmSync(testProjDir, { recursive: true, force: true });
 }
+
+// 7.8 Manual mode switch: /mode ppt
+commands.get("mode").handler("ppt", mockCtx);
+assert.ok(activeTools.includes("generate_image"), "generate_image must be active in ppt mode");
+assert.ok(activeTools.includes("fetch_content"), "fetch_content must be active in ppt mode");
+console.log("  ✓ Command: /mode ppt dynamic switch passed");
 
 console.log("\n🎉 ALL 7 TEST SUITES PASSED FLAWLESSLY! 100% E2E VERIFIED.");
