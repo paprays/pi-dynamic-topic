@@ -98,8 +98,16 @@ export interface DiscoveredSkill {
  */
 export function setTerminalTitle(title: string) {
     if (process.stdout.isTTY) {
-        process.stdout.write(`\x1b]0;${title}\x07`);
+        // 标题来自模型输出，必须剥掉控制字符，否则等于把 OSC 转义序列的控制权交给模型
+        process.stdout.write(`\x1b]0;${sanitizeTitle(title)}\x07`);
     }
+}
+
+/**
+ * 标题净化：去掉全部 C0/DEL 控制字符并截断
+ */
+export function sanitizeTitle(title: string): string {
+    return (title || "").replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
 }
 
 /**
@@ -169,13 +177,42 @@ export function generateFallbackTopic(text: string): string {
 }
 
 /**
+ * 把任意来源的对象收敛成合法配置：缺字段回退默认，modes 使用无原型对象
+ * （避免 "constructor" / "__proto__" 这类键被当成已存在的模式）
+ */
+export function coerceConfig(raw: any): DynamicTopicConfig {
+    const modes: DynamicTopicConfig["modes"] = Object.create(null);
+    const src =
+        raw?.modes && typeof raw.modes === "object" ? raw.modes : DEFAULT_CONFIG.modes;
+    for (const [key, val] of Object.entries(src)) {
+        const v = val as any;
+        if (!v || typeof v !== "object") continue;
+        modes[key] = {
+            description: typeof v.description === "string" ? v.description : "",
+            recommendedTools: Array.isArray(v.recommendedTools) ? v.recommendedTools : [],
+            recommendedSkills: Array.isArray(v.recommendedSkills) ? v.recommendedSkills : [],
+        };
+    }
+    return {
+        version: 1,
+        baseTools: Array.isArray(raw?.baseTools) ? raw.baseTools : [...DEFAULT_CONFIG.baseTools],
+        modes,
+        customToolAliases:
+            raw?.customToolAliases && typeof raw.customToolAliases === "object"
+                ? { ...raw.customToolAliases }
+                : { ...DEFAULT_CONFIG.customToolAliases },
+    };
+}
+
+/**
  * 解析用户配置，项目级优先，回退到全局或默认值
+ * 始终返回独立副本，绝不把 DEFAULT_CONFIG 本体交出去
  */
 export function loadConfig(cwd: string): DynamicTopicConfig {
     const projectPath = path.join(cwd, ".pi", "extension-settings", "dynamic-topic.json");
     if (fs.existsSync(projectPath)) {
         try {
-            return JSON.parse(fs.readFileSync(projectPath, "utf-8"));
+            return coerceConfig(JSON.parse(fs.readFileSync(projectPath, "utf-8")));
         } catch {
             // ignore
         }
@@ -185,13 +222,13 @@ export function loadConfig(cwd: string): DynamicTopicConfig {
     const globalPath = path.join(agentDir, "extension-settings", "dynamic-topic.json");
     if (fs.existsSync(globalPath)) {
         try {
-            return JSON.parse(fs.readFileSync(globalPath, "utf-8"));
+            return coerceConfig(JSON.parse(fs.readFileSync(globalPath, "utf-8")));
         } catch {
             // ignore
         }
     }
 
-    return DEFAULT_CONFIG;
+    return coerceConfig(DEFAULT_CONFIG);
 }
 
 /**
@@ -353,18 +390,12 @@ export function parseTopicXml(text: string): ParsedTopicBlock | null {
 }
 
 /**
- * 从回复文本中剥离 XML 标签
+ * 从回复文本中剥离 XML
+ * 只删完整的 <topic> 块：裸的 <title>/<tools> 等标签可能是用户正在讨论的内容
  */
 export function stripTopicXmlFromText(text: string): string {
     if (!text) return "";
-    return text
-        .replace(/<topic[\s\S]*?<\/topic>/gi, "")
-        .replace(/<title>[\s\S]*?<\/title>/gi, "")
-        .replace(/<description>[\s\S]*?<\/description>/gi, "")
-        .replace(/<mode>[\s\S]*?<\/mode>/gi, "")
-        .replace(/<tools>[\s\S]*?<\/tools>/gi, "")
-        .replace(/<skills>[\s\S]*?<\/skills>/gi, "")
-        .trimEnd();
+    return text.replace(/<topic[\s\S]*?<\/topic>/gi, "").trimEnd();
 }
 
 /**
@@ -401,14 +432,14 @@ export function normalizeTools(
             continue;
         }
 
-        // 3. 后缀/前缀/模糊包含匹配
+        // 3. 后缀/前缀匹配
+        // ponytail: 不做裸子串兜底 —— 那会把 "x" 绑到 lsp_fix，且结果随工具注册顺序漂移
         const fuzzy = allToolsLower.find(
             (t) =>
                 t.lower.endsWith(`_${targetLower}`) ||
                 t.lower.endsWith(`-${targetLower}`) ||
                 t.lower.startsWith(`${targetLower}_`) ||
-                t.lower.startsWith(`${targetLower}-`) ||
-                t.lower.includes(targetLower)
+                t.lower.startsWith(`${targetLower}-`)
         );
         if (fuzzy) {
             normalized.push(fuzzy.raw);
@@ -467,36 +498,29 @@ Rules:
 
 /**
  * 解析模式参数支持 --tools, --skills, --desc
+ * 按 token 切分而非正则抠取：工具名/技能名里的连字符必须原样保留
  */
 export function parseModeArgs(rawArgs: string) {
+    const tokens = rawArgs.trim().match(/"[^"]*"|'[^']*'|\S+/g) || [];
+    const unquote = (s: string) => s.replace(/^["']|["']$/g, "");
+    const split = (s: string) => s.split(",").map((x) => x.trim()).filter(Boolean);
+
     let tools: string[] | undefined;
     let skills: string[] | undefined;
     let desc: string | undefined;
+    const positional: string[] = [];
 
-    let remaining = rawArgs.trim();
-
-    const toolsMatch = remaining.match(/(?:--tools|-t)\s+([^\s-]+(?:\s*,\s*[^\s-]+)*)/i);
-    if (toolsMatch) {
-        tools = toolsMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
-        remaining = remaining.replace(toolsMatch[0], " ");
+    for (let i = 0; i < tokens.length; i++) {
+        const t = tokens[i];
+        if (t === "--tools" || t === "-t") tools = split(unquote(tokens[++i] || ""));
+        else if (t === "--skills" || t === "-s") skills = split(unquote(tokens[++i] || ""));
+        else if (t === "--desc" || t === "-d") desc = unquote(tokens[++i] || "");
+        else positional.push(unquote(t));
     }
 
-    const skillsMatch = remaining.match(/(?:--skills|-s)\s+([^\s-]+(?:\s*,\s*[^\s-]+)*)/i);
-    if (skillsMatch) {
-        skills = skillsMatch[1].split(",").map((s) => s.trim()).filter(Boolean);
-        remaining = remaining.replace(skillsMatch[0], " ");
-    }
-
-    const descMatch = remaining.match(/(?:--desc|-d)\s+["']?([^"'-]+)["']?/i);
-    if (descMatch) {
-        desc = descMatch[1].trim();
-        remaining = remaining.replace(descMatch[0], " ");
-    }
-
-    const parts = remaining.trim().split(/\s+/).filter(Boolean);
-    const name = parts[0]?.toLowerCase();
-    if (!desc && parts.length > 1) {
-        desc = parts.slice(1).join(" ");
+    const name = positional[0]?.toLowerCase();
+    if (!desc && positional.length > 1) {
+        desc = positional.slice(1).join(" ");
     }
 
     return { name, desc, tools, skills };
@@ -697,7 +721,9 @@ export default function (pi: ExtensionAPI) {
     let activeSkillInstructions: string[] = [];
     let shouldInjectInNextPrompt = false;
     let expectingTopic = false;
-    let config: DynamicTopicConfig = DEFAULT_CONFIG;
+    // 路由是否真的落过地。模型漏输出 <topic> 时必须放行全部技能，否则整个会话静默失能
+    let routingApplied = false;
+    let config: DynamicTopicConfig = coerceConfig(DEFAULT_CONFIG);
     let discoveredSkillsMap = new Map<string, DiscoveredSkill>();
 
     function refreshDiscoveredSkills(cwd: string) {
@@ -742,6 +768,7 @@ export default function (pi: ExtensionAPI) {
         currentMode = mode || "general";
         activeSkills = new Set(skills.map((s) => s.toLowerCase()));
         activeSkillInstructions = loadSkillInstructions(skills);
+        routingApplied = true;
 
         // 合并基础工具与模型自选工具
         const mergedTools = Array.from(new Set([...config.baseTools, ...tools]));
@@ -782,6 +809,7 @@ export default function (pi: ExtensionAPI) {
         activeSkillInstructions = [];
         shouldInjectInNextPrompt = false;
         expectingTopic = false;
+        routingApplied = false;
 
         const entries = ctx.sessionManager.getEntries();
         let savedState: any = null;
@@ -854,7 +882,12 @@ export default function (pi: ExtensionAPI) {
 
     // 4. 发送给大模型前：过滤系统提示词，实现技能按需隔离注入
     pi.on("before_agent_start", async (event) => {
-        let systemPrompt = filterSystemPromptSkills(event.systemPrompt, activeSkills);
+        // 只在「等待路由」或「路由已落地」时过滤技能。
+        // 模型漏输出 <topic> 时两者皆假，原样放行，避免技能整个会话消失且无自愈
+        let systemPrompt = event.systemPrompt;
+        if (expectingTopic || routingApplied) {
+            systemPrompt = filterSystemPromptSkills(systemPrompt, activeSkills);
+        }
 
         if (activeSkillInstructions.length > 0) {
             systemPrompt = `${systemPrompt}\n\n## Activated Skills Instructions\n${activeSkillInstructions.join("\n\n")}`;

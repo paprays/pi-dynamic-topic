@@ -401,6 +401,181 @@ await commands.get("mode").handler("del review", mockCtx);
 assert.ok(notifiedMessages.some((m) => m.msg.includes("成功删除模式 [review]")));
 console.log("  ✓ Command: /mode del passed");
 
+// ==========================================
+// Test Suite 8: Audit Regressions
+// 每条对应一个曾经实测复现的缺陷，断言方向已翻转为"修好了"
+// ==========================================
+console.log("\n[Test 8] Audit Regressions");
+
+import ext from "./index.ts";
+import { parseModeArgs, coerceConfig, sanitizeTitle } from "./index.ts";
+
+const REG_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search",
+    "ask_user", "fetch_content", "get_search_content", "gdb-mcp_open", "lsp_diagnostics",
+    "lsp_fix", "ast_search", "nu", "interactive_shell", "generate_image"];
+
+function regHarness(cwd) {
+    let tools = [];
+    const ev = new Map(), cmds = new Map(), notes = [];
+    ext({
+        getAllTools: () => REG_TOOLS.map((name) => ({ name })),
+        getActiveTools: () => tools,
+        setActiveTools: (t) => { tools = t; },
+        appendEntry: () => {},
+        on: (n, h) => ev.set(n, h),
+        registerCommand: (n, d) => cmds.set(n, d),
+        getCommands: () => [],
+    });
+    const ctx = {
+        cwd,
+        sessionManager: { getEntries: () => [] },
+        ui: { notify: (msg, level) => notes.push({ msg, level }) },
+        model: { id: "m" },
+        modelRegistry: { complete: async () => ({ role: "assistant", content: [] }) },
+    };
+    return { ev, cmds, notes, ctx, tools: () => tools };
+}
+const reply = (text) => ({ message: { role: "assistant", content: [{ type: "text", text }] } });
+
+// 8.1 模式参数里的连字符必须保留（曾经 gdb-mcp_open -> "gdb"，残渣漏进 description）
+const args = parseModeArgs("rev 逆向分析 --tools gdb-mcp_open,ast_search --skills karpathy-guidelines");
+assert.equal(args.name, "rev");
+assert.equal(args.desc, "逆向分析");
+assert.deepEqual(args.tools, ["gdb-mcp_open", "ast_search"]);
+assert.deepEqual(args.skills, ["karpathy-guidelines"]);
+console.log("  ✓ 8.1 Hyphenated tool/skill names survive mode args");
+
+// 8.2 loadConfig 必须交出副本，CRUD 不得改写导出的 DEFAULT_CONFIG
+const isolatedDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-iso-"));
+// 必须走"无任何配置文件 -> 回退 DEFAULT_CONFIG"这条路径，否则测不到别名污染
+const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+process.env.PI_CODING_AGENT_DIR = isolatedDir;
+const cfgA = loadConfig(isolatedDir);
+assert.deepEqual(
+    Object.keys(cfgA.modes).sort(),
+    Object.keys(DEFAULT_CONFIG.modes).sort(),
+    "must have fallen back to DEFAULT_CONFIG (no config file in play)"
+);
+assert.notEqual(cfgA, DEFAULT_CONFIG, "loadConfig must not hand out DEFAULT_CONFIG itself");
+assert.notEqual(cfgA.modes, DEFAULT_CONFIG.modes, "modes must not alias DEFAULT_CONFIG.modes");
+cfgA.modes.zzz = { description: "x", recommendedTools: [], recommendedSkills: [] };
+delete cfgA.modes.code;
+assert.ok(!("zzz" in DEFAULT_CONFIG.modes), "DEFAULT_CONFIG must stay clean");
+assert.ok("code" in DEFAULT_CONFIG.modes, "DEFAULT_CONFIG must keep its own modes");
+process.env.PI_CODING_AGENT_DIR = prevAgentDir;
+console.log("  ✓ 8.2 DEFAULT_CONFIG is not aliased by loadConfig");
+
+// 8.3 半成品配置不得让会话从第一条消息起就崩
+const partialProj = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-partial-"));
+fs.mkdirSync(path.join(partialProj, ".pi", "extension-settings"), { recursive: true });
+fs.writeFileSync(
+    path.join(partialProj, ".pi", "extension-settings", "dynamic-topic.json"),
+    '{"version":1}'
+);
+const coerced = coerceConfig(JSON.parse('{"version":1}'));
+assert.ok(Array.isArray(coerced.baseTools) && coerced.baseTools.length > 0);
+assert.ok(coerced.modes && typeof coerced.modes === "object");
+{
+    const prev = process.cwd();
+    process.chdir(partialProj);
+    try {
+        const h = regHarness(partialProj);
+        await h.ev.get("session_start")({}, h.ctx);
+        assert.ok(Array.isArray(h.tools()) && h.tools().length > 0, "baseTools must be applied");
+        const r = await h.ev.get("input")({ text: "第一条消息" }, h.ctx);
+        assert.equal(r.action, "transform", "input hook must not throw on a partial config");
+    } finally {
+        process.chdir(prev);
+        fs.rmSync(partialProj, { recursive: true, force: true });
+    }
+}
+console.log("  ✓ 8.3 Partial config file no longer breaks the session");
+
+// 8.4 工具匹配不得靠裸子串，且不得随注册顺序漂移
+assert.deepEqual(normalizeTools(["x"], REG_TOOLS, {}), [], "'x' must not bind lsp_fix");
+assert.deepEqual(normalizeTools(["se"], REG_TOOLS, {}), [], "'se' must not bind any tool");
+assert.deepEqual(
+    normalizeTools(["se"], REG_TOOLS, {}),
+    normalizeTools(["se"], [...REG_TOOLS].reverse(), {}),
+    "result must not depend on tool registration order"
+);
+assert.deepEqual(normalizeTools(["ast"], REG_TOOLS, {}), ["ast_search"], "prefix match still works");
+console.log("  ✓ 8.4 Tool matching is order-independent, no bare substring fallback");
+
+// 8.5 原型链键必须走"未知模式"而不是抛 TypeError
+{
+    const protoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-proto-"));
+    const h = regHarness(protoDir);
+    await h.ev.get("session_start")({}, h.ctx);
+    for (const key of ["constructor", "__proto__"]) {
+        h.notes.length = 0;
+        await h.cmds.get("mode").handler(key, h.ctx);
+        assert.ok(h.notes.some((n) => n.msg.includes("未知模式")), `/mode ${key} should be rejected cleanly`);
+    }
+    fs.rmSync(protoDir, { recursive: true, force: true });
+}
+console.log("  ✓ 8.5 Prototype keys rejected instead of crashing");
+
+// 8.6 模型控制的标题不得把 OSC 转义写进终端
+assert.equal(sanitizeTitle("A\x07\x1b]0;PWNED\x07B"), "A  ]0;PWNED B");
+assert.ok(!sanitizeTitle("x\x1b]0;y\x07").includes("\x1b"), "ESC must be stripped");
+assert.ok(!sanitizeTitle("x\x1b]0;y\x07").includes("\x07"), "BEL must be stripped");
+// 闭环：模型输出的注入标题真正写到 stdout 时，必须只剩一条完整的 OSC 序列
+{
+    const oscDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-osc-"));
+    const captured = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    const realTTY = process.stdout.isTTY;
+    process.stdout.isTTY = true;
+    process.stdout.write = (chunk, ...rest) => {
+        if (typeof chunk === "string" && chunk.includes("\x1b]0;")) { captured.push(chunk); return true; }
+        return realWrite(chunk, ...rest);
+    };
+    try {
+        const h = regHarness(oscDir);
+        await h.ev.get("session_start")({}, h.ctx);
+        await h.ev.get("input")({ text: "q" }, h.ctx);
+        await h.ev.get("message_end")(reply(
+            "ok\n<topic><title>A\x07\x1b]0;PWNED\x07B</title><mode>general</mode></topic>"), h.ctx);
+    } finally {
+        process.stdout.write = realWrite;
+        process.stdout.isTTY = realTTY;
+        fs.rmSync(oscDir, { recursive: true, force: true });
+    }
+    assert.ok(captured.length > 0, "a title should have been written");
+    for (const w of captured) {
+        assert.equal(w.match(/\x1b\]0;/g).length, 1, "model must not be able to emit a second OSC sequence");
+        assert.equal(w.match(/\x07/g).length, 1, "model must not be able to emit a stray BEL");
+    }
+}
+console.log("  ✓ 8.6 Terminal title is sanitized before OSC write (end-to-end)");
+
+// 8.7 只剥 <topic> 块，不得吃掉用户正在讨论的 <title>
+const htmlTalk = "这样写：\n<title>My Page</title>\n就好了。\n<topic><title>网页标题</title><mode>general</mode></topic>";
+const keptHtml = stripTopicXmlFromText(htmlTalk);
+assert.ok(keptHtml.includes("<title>My Page</title>"), "unrelated HTML must survive");
+assert.ok(!keptHtml.includes("<topic>"), "topic block must still be stripped");
+console.log("  ✓ 8.7 Unrelated <title> survives stripping");
+
+// 8.8 模型漏输出 <topic> 时技能不得永久隐身
+{
+    const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-skill-"));
+    const SP = "前言\n<available_skills>\n<skill><name>ponytail</name></skill>\n</available_skills>\n后语";
+    const h = regHarness(skillDir);
+    await h.ev.get("session_start")({}, h.ctx);
+    await h.ev.get("input")({ text: "q" }, h.ctx);
+    const turn1 = await h.ev.get("before_agent_start")({ systemPrompt: SP }, h.ctx);
+    assert.ok(!turn1.systemPrompt.includes("ponytail"), "cold-start isolation must be preserved");
+    await h.ev.get("message_end")(reply("我忘了输出 topic 块"), h.ctx);
+    await h.ev.get("agent_end")({}, h.ctx);
+    const turn2 = await h.ev.get("before_agent_start")({ systemPrompt: SP }, h.ctx);
+    assert.ok(turn2.systemPrompt.includes("ponytail"), "skills must come back when routing never landed");
+    fs.rmSync(skillDir, { recursive: true, force: true });
+}
+console.log("  ✓ 8.8 Skills recover when the model omits <topic>");
+
+fs.rmSync(isolatedDir, { recursive: true, force: true });
+
 fs.rmSync(testAgentDir, { recursive: true, force: true });
 
-console.log("\n🎉 ALL 7 TEST SUITES PASSED FLAWLESSLY! 100% E2E VERIFIED.");
+console.log("\n🎉 ALL 8 TEST SUITES PASSED. 100% E2E VERIFIED.");
