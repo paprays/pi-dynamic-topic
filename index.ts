@@ -471,14 +471,35 @@ export function filterSystemPromptSkills(systemPrompt: string, activeSkillNames:
 /**
  * 构造首轮注入给 User Prompt 的协议指令
  */
-export function buildRoutingInstruction(availableTools: string[], availableSkills: string[]): string {
+export function buildRoutingInstruction(
+    availableTools: string[],
+    availableSkills: string[],
+    modes?: Record<string, { description: string; recommendedTools: string[]; recommendedSkills: string[] }>
+): string {
+    const modeKeys =
+        modes && Object.keys(modes).length > 0
+            ? Object.keys(modes).join(" | ") + " | custom"
+            : "code | academic | ppt | ops | general | custom";
+
+    const modeLines =
+        modes && Object.keys(modes).length > 0
+            ? `\n- Defined Modes & Defaults:\n` +
+              Object.entries(modes)
+                  .map(([key, val]) => {
+                      const t = val.recommendedTools?.length ? val.recommendedTools.join(", ") : "none";
+                      const s = val.recommendedSkills?.length ? val.recommendedSkills.join(", ") : "none";
+                      return `  * ${key}: ${val.description || "无说明"} (Default tools: [${t}], Default skills: [${s}])`;
+                  })
+                  .join("\n")
+            : "";
+
     return `
 [Session Topic & Capability Routing (this turn ONLY)]
 At the very end of your final answer, on a new line, output:
 <topic>
   <title>2-6 Chinese characters, short</title>
   <description>10-25 Chinese characters, the core task or question</description>
-  <mode>code | academic | ppt | ops | general | custom</mode>
+  <mode>${modeKeys}</mode>
   <tools>
     <tool>tool_name</tool>
   </tools>
@@ -488,7 +509,7 @@ At the very end of your final answer, on a new line, output:
 </topic>
 Rules:
 - <title> & <description>: summarize current session in Chinese.
-- <mode>: broad intent category for mental focus (e.g. code, academic, ppt, ops, general).
+- <mode>: broad intent category for mental focus (e.g. ${modes && Object.keys(modes).length > 0 ? Object.keys(modes).join(", ") : "code, academic, ppt, ops, general"}).${modeLines}
 - <tools> & <skills>: freely choose ANY tools and skills you need from the full available list below. You can freely mix tools across domains.
 - Available Tools Pool: [${availableTools.join(", ")}]
 - Available Skills Pool: [${availableSkills.join(", ")}]
@@ -868,7 +889,8 @@ export default function (pi: ExtensionAPI) {
 
             const instruction = buildRoutingInstruction(
                 nonBaseTools.length > 0 ? nonBaseTools : allTools,
-                availableSkills
+                availableSkills,
+                config.modes
             );
 
             return {

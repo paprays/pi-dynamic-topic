@@ -202,6 +202,15 @@ const instruction = buildRoutingInstruction(["gdb-mcp_open", "nu"], ["ponytail",
 assert.ok(instruction.includes("gdb-mcp_open, nu"));
 assert.ok(instruction.includes("ponytail, academic-paper"));
 assert.ok(instruction.includes("<topic>"));
+
+const instructionWithModes = buildRoutingInstruction(
+    ["gdb-mcp_open"],
+    ["ponytail"],
+    DEFAULT_CONFIG.modes
+);
+assert.ok(instructionWithModes.includes("Defined Modes & Defaults:"));
+assert.ok(instructionWithModes.includes("academic:"));
+assert.ok(instructionWithModes.includes("source_check"));
 console.log("  ✓ Routing instruction generation passed");
 
 // ==========================================
