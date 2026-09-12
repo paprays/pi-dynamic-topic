@@ -1,8 +1,11 @@
 {
   "name": "pi-dynamic-topic",
   "version": "1.0.0",
-  "description": "Pi extension that dynamically summarizes session topics and syncs them to terminal titles and Herdr tabs on startup and post-compaction.",
+  "description": "Pi extension that routes each session: summarizes the topic to terminal title and Herdr tabs, and activates only the tools and skills that session actually needs.",
   "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
   "keywords": [
     "pi-package",
     "pi-extension",
