@@ -513,7 +513,7 @@ Rules:
 - <tools> & <skills>: freely choose ANY tools and skills you need from the full available list below. You can freely mix tools across domains.
 - Available Tools Pool: [${availableTools.join(", ")}]
 - Available Skills Pool: [${availableSkills.join(", ")}]
-- This rule applies to this turn only; do not repeat it in later turns.
+- This rule applies to this turn only; Don't add any topic information in the latter turn
 `;
 }
 
@@ -836,12 +836,16 @@ export default function (pi: ExtensionAPI) {
         let savedState: any = null;
         let firstUserText = "";
         let userMsgCount = 0;
+        let compactionPending = false;
 
         for (const entry of entries) {
             if (entry.type === "custom" && (entry as any).customType === ENTRY_TYPE_TOPIC) {
                 savedState = (entry as any).data;
+            } else if (entry.type === "compaction") {
+                compactionPending = true;
             } else if (entry.type === "message" && entry.message?.role === "user") {
                 userMsgCount++;
+                compactionPending = false;
                 if (!firstUserText) {
                     firstUserText = extractUserText(entry.message.content);
                 }
@@ -857,12 +861,14 @@ export default function (pi: ExtensionAPI) {
                 false,
                 ctx
             );
+            shouldInjectInNextPrompt = compactionPending;
         } else if (userMsgCount === 0) {
             pi.setActiveTools(config.baseTools);
             shouldInjectInNextPrompt = true;
         } else {
             const fallback = generateFallbackTopic(firstUserText);
             applyTopic(fallback, "general", [], [], false, ctx);
+            shouldInjectInNextPrompt = compactionPending;
         }
     });
 
