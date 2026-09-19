@@ -5,8 +5,8 @@ A Pi extension that turns the first message of a session into two things at once
 ## How it works
 
 1. **Cold start** — only `baseTools` are active. Skills are hidden from the system prompt.
-2. **First message** — a short routing instruction is appended to your prompt (that turn only), listing every available tool and skill.
-3. **Model replies** — it ends with a `<topic>` block naming a title, description, mode, and the tools/skills it actually needs. The block is stripped before rendering.
+2. **First message** — a short routing instruction is appended to the **system prompt** (that turn only), listing the tools and skills that are not active yet. Your own message is never rewritten, and the instruction vanishes as soon as routing lands, so it cannot nudge later turns.
+3. **Model replies** — it ends with a `<topic>` block naming a title, description, mode, and the tools/skills it actually needs. A *trailing* block is stripped before rendering; blocks quoted mid-answer (e.g. inside code fences) are left alone.
 4. **Rest of the session** — the chosen tools are activated on top of `baseTools`, and only the chosen skills appear in the system prompt.
 5. **After compaction** — step 2 repeats, so the topic and route follow what the session has become.
 

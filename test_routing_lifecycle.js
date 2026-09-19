@@ -98,23 +98,28 @@ console.log("\n[Suite 1] 首轮注入与单轮隔离");
 
     const q = "帮我用 gdb 排查这个 C++ 段错误";
     const r1 = await h.input(q);
-    assert.equal(r1.action, "transform");
-    assert.ok(r1.text.startsWith(q), "原用户文本必须原样保留在前");
-    assert.ok(r1.text.includes(HEADER), "必须带协议头");
-    assert.ok(r1.text.includes("Available Tools Pool"));
-    assert.ok(r1.text.includes("gdb-mcp_open"), "池里必须有非基础工具");
-    assert.ok(!r1.text.includes("${"), "模板必须完成插值");
-    ok("1.2 首轮注入且模板已插值");
+    assert.equal(r1.action, "continue", "用户文本不得被打扮：指令走 system prompt");
+    const injected = await h.prompt();
+    assert.ok(injected.systemPrompt.includes(HEADER), "必须带协议头");
+    assert.ok(injected.systemPrompt.includes("Tools not yet active"));
+    assert.ok(injected.systemPrompt.includes("gdb-mcp_open"), "池里必须有非基础工具");
+    assert.ok(!injected.systemPrompt.includes("${"), "模板必须完成插值");
+    ok("1.2 首轮经 system prompt 注入且模板已插值");
 
-    for (const t of ["第二轮问题", "第三轮问题", "第四轮问题"]) {
-        assert.equal((await h.input(t)).action, "continue", `"${t}" 不得再注入`);
-    }
-    ok("1.3 同会话只注入一次");
+    // 路由落地后，system prompt 必须立刻干净 —— 这是“后续轮次不再输出 topic”的根保障
+    await h.reply(TOPIC_CODE);
+    await h.end();
+    await h.input("第二轮问题");
+    const second = await h.prompt();
+    assert.ok(!second.systemPrompt.includes(HEADER), "后续轮次不得再带指令块");
+    assert.ok(!second.systemPrompt.includes("Tools not yet active"));
+    ok("1.3 指令只活在首轮，落轮即卸载");
 
     const h2 = harness();
     await h2.start();
     assert.equal((await h2.input("")).action, "continue", "空文本本就无需注入");
-    assert.equal((await h2.input("真正的第一句")).action, "transform", "空输入不得消费注入位");
+    await h2.input("真正的第一句");
+    assert.ok((await h2.prompt()).systemPrompt.includes(HEADER), "空输入不得消费注入位");
     ok("1.4 空文本输入不消费注入位");
 }
 
@@ -173,12 +178,12 @@ console.log("\n[Suite 3] 配置驱动的模式表");
             DEFAULT_CONFIG.baseTools.every((t) => h.tools().includes(t)),
             "只配 modes 时 baseTools 必须回落到默认值"
         );
-        const r = await h.input("随便问一句");
-        assert.equal(r.action, "transform");
-        assert.ok(r.text.includes("Defined Modes & Defaults:"), "配置里的模式要以定义表形式注入");
-        assert.ok(r.text.includes("special:"));
-        assert.ok(r.text.includes("特化模式描述"));
-        assert.ok(!r.text.includes("${"), "配置驱动路径同样不得漏占位符");
+        await h.input("随便问一句");
+        const injected = (await h.prompt()).systemPrompt;
+        assert.ok(injected.includes("Defined Modes & Defaults:"), "配置里的模式要以定义表形式注入");
+        assert.ok(injected.includes("special:"));
+        assert.ok(injected.includes("特化模式描述"));
+        assert.ok(!injected.includes("${"), "配置驱动路径同样不得漏占位符");
         ok("3.1 配置文件的 modes 进入注入指令");
     } finally {
         process.chdir(prevCwd);
@@ -200,20 +205,22 @@ console.log("\n[Suite 4] compact 重注入");
     assert.ok(routed.includes("gdb-mcp_open"), "路由后 gdb 必须激活");
 
     await h.compact();
-    const r = await h.input("压缩后的第一句话");
-    assert.equal(r.action, "transform", "compact 后必须重新注入");
-    assert.ok(r.text.includes(HEADER));
-    assert.ok(r.text.includes("Available Tools Pool"));
-    assert.ok(!r.text.includes("${"));
+    await h.input("压缩后的第一句话");
+    const compressed = (await h.prompt()).systemPrompt;
+    assert.ok(compressed.includes(HEADER), "compact 后必须重新注入");
+    assert.ok(compressed.includes("Tools not yet active"));
+    assert.ok(!compressed.includes("${"));
     assert.deepEqual(h.tools(), routed, "compact 不得改变工具集");
     ok("4.1 compact 成功后下一次输入重注入");
 
-    assert.equal((await h.input("压缩后的第二句话")).action, "continue", "compact 注入也是单次");
+    await h.end();
+    assert.ok(!(await h.prompt()).systemPrompt.includes(HEADER), "一轮过后照样卸载");
     ok("4.2 compact 注入同样单次生效");
 
     await h.end();
     await h.compact();
-    assert.equal((await h.input("第二次压缩后")).action, "transform", "每次 compact 都要重新武装");
+    await h.input("第二次压缩后");
+    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "每次 compact 都要重新武装");
     ok("4.3 多次 compact 每次都重新武装");
 }
 
@@ -286,7 +293,10 @@ console.log("\n[Suite 7] 技能隔离与自愈");
     await h.start();
     await h.input("第一问");
     const cold = await h.prompt();
-    assert.ok(!cold.systemPrompt.includes("ponytail"), "注入等待期技能应被隔离");
+    // 指令块本身会列出可用技能名（供模型挑选），所以此处断言的是“技能没有被加载/注入”：
+    // 等待期必须看不到 <available_skills> 列表，也看不到技能正文
+    assert.ok(!cold.systemPrompt.includes("<available_skills>"), "注入等待期技能列表应被隔离");
+    assert.ok(!cold.systemPrompt.includes("## Activated Skills Instructions"), "等待期不得加载技能正文");
     await h.reply(
         "<topic><title>闲聊</title><description>普通对话</description><mode>general</mode></topic>"
     );
@@ -344,16 +354,16 @@ console.log("\n[Suite 9] compact 后会话重入");
     // 9.1 压缩后重入 → 下一条输入仍须注入
     const h = harness({ entries: [userMsg("第一问"), { type: "compaction" }, saved()] });
     await h.start();
-    const r = await h.input("压缩后重入的第一句");
-    assert.equal(r.action, "transform", "compact 后会话重入仍须注入");
-    assert.ok(r.text.includes(HEADER));
+    await h.input("压缩后重入的第一句");
+    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "compact 后会话重入仍须注入");
     assert.ok(h.tools().includes("gdb-mcp_open"), "重入仍须恢复工具");
     ok("9.1 compact + session_start 再入 → 仍注入");
 
     // 9.2 无压缩的普通 resume 不得被误注入
     const h2 = harness({ entries: [userMsg("历史第一问"), saved()] });
     await h2.start();
-    assert.equal((await h2.input("普通 resume")).action, "continue", "无压缩的 resume 不该注入");
+    await h2.input("普通 resume");
+    assert.ok(!(await h2.prompt()).systemPrompt.includes(HEADER), "无压缩的 resume 不该注入");
     ok("9.2 无 compact 的 resume 不注入");
 
     // 9.3 压缩后又发过用户消息 → 注入机会已用掉，不得重复注入
@@ -361,20 +371,94 @@ console.log("\n[Suite 9] compact 后会话重入");
         entries: [userMsg("第一问"), { type: "compaction" }, userMsg("压缩后第一句"), saved()],
     });
     await h3.start();
-    assert.equal((await h3.input("再下一句")).action, "continue", "压缩后的注入机会已消费");
+    await h3.input("再下一句");
+    assert.ok(!(await h3.prompt()).systemPrompt.includes(HEADER), "压缩后的注入机会已消费");
     ok("9.3 压缩后已发过话 → 不注入");
 
     // 9.4 冷启动仍注入（userMsgCount === 0）
     const h4 = harness();
     await h4.start();
-    assert.equal((await h4.input("全新会话")).action, "transform", "冷启动必须注入");
+    await h4.input("全新会话");
+    assert.ok((await h4.prompt()).systemPrompt.includes(HEADER), "冷启动必须注入");
     ok("9.4 冷启动仍注入");
 
     // 9.5 只有历史、没存过状态、也没压缩 → 只 fallback，不注入
     const h5 = harness({ entries: [userMsg("旧会话第一问")] });
     await h5.start();
-    assert.equal((await h5.input("继续")).action, "continue", "无状态历史不得注入");
+    await h5.input("继续");
+    assert.ok(!(await h5.prompt()).systemPrompt.includes(HEADER), "无状态历史不得注入");
     ok("9.5 无状态历史不注入");
+}
+
+// ==========================================
+// Suite 10: 后续轮次 topic 泄漏
+// 回归：首轮指令留在上下文里，模型后续轮次仍会输出 <topic>；
+//       message_end 曾因 expectingTopic=false 直接 return，导致泄漏块
+//       既不剥离也不落库，直接进 UI 并在历史里自我强化。
+// ==========================================
+console.log("\n[Suite 10] 后续轮次 topic 泄漏");
+{
+    const h = harness();
+    await h.start();
+    await h.input("第一问");
+    const first = await h.reply(TOPIC_CODE);
+    assert.ok(!first.message.content[0].text.includes("<topic>"), "首轮照样剥离");
+    await h.end();
+
+    await h.input("第二问");
+    const leak = await h.reply(`答案正文。\n${TOPIC_CODE.split("\n").slice(1).join("\n")}`);
+    assert.ok(leak && leak.message, "后续轮次的 topic 块必须被剥离（不得放行）");
+    assert.equal(leak.message.content[0].text, "答案正文。", "正文保留，topic 块去掉");
+    assert.equal(h.appended.length, 1, "后续轮次不得重新落库");
+    assert.deepEqual(h.tools(), [...DEFAULT_CONFIG.baseTools, "gdb-mcp_open"], "后续轮次不得改工具集");
+    ok("10.1 后续轮次 topic 块被剥离且不重新路由");
+
+    const plain = await h.reply("没有 topic 块");
+    assert.equal(plain, undefined, "无 topic 时不得改写消息");
+    ok("10.2 无 topic 时不改写");
+}
+
+// ==========================================
+// Suite 11: 能力池只列未激活项
+// 已激活的工具/已注入正文的技能重复列在池子里，既蹭 token 又逗模型重复选；
+// 池子去重后，模型改选必须累加，否则没重新点名的项会被静默丢掉。
+// ==========================================
+console.log("\n[Suite 11] 能力池只列未激活项");
+{
+    for (const name of ["ponytail", "deep-research"]) {
+        const d = path.join(isolatedAgentDir, "skills", name);
+        fs.mkdirSync(d, { recursive: true });
+        fs.writeFileSync(path.join(d, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} 说明\n---\n${name} 正文\n`);
+    }
+    const line = (sp, prefix) => sp.split("\n").find((l) => l.startsWith(prefix)) || "";
+
+    const h = harness();
+    await h.start();
+    await h.input("第一问");
+    const cold = (await h.prompt()).systemPrompt;
+    assert.ok(line(cold, "- Tools not yet active:").includes("gdb-mcp_open"), "冷启动：额外工具在池子里");
+    assert.ok(line(cold, "- Skills not yet loaded:").includes("ponytail"), "冷启动：技能在池子里");
+    ok("11.1 冷启动池子列出全部额外项");
+
+    await h.reply(TOPIC_CODE); // 激活 gdb-mcp_open + ponytail
+    await h.end();
+    await h.compact();
+    await h.input("压缩后继续");
+    const warm = (await h.prompt()).systemPrompt;
+    assert.ok(!line(warm, "- Tools not yet active:").includes("gdb-mcp_open"), "已激活工具不得重复列出");
+    assert.ok(!line(warm, "- Skills not yet loaded:").includes("ponytail"), "已加载技能不得重复列出");
+    assert.ok(line(warm, "- Skills not yet loaded:").includes("deep-research"), "未加载技能仍应可选项");
+    ok("11.2 重注入时已激活项不再出现在池子里");
+
+    await h.reply(
+        "<topic><title>接着干</title><description>压缩后继续原来的活</description><mode>code</mode></topic>"
+    );
+    assert.ok(h.tools().includes("gdb-mcp_open"), "没重新点名的已激活工具不得被静默丢掉");
+    assert.ok(
+        (h.appended.at(-1).data.skills || []).includes("ponytail"),
+        "没重新点名的已加载技能不得被静默丢掉"
+    );
+    ok("11.3 池子去重后改选是累加，不丢能力");
 }
 
 fs.rmSync(isolatedAgentDir, { recursive: true, force: true });

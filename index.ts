@@ -157,6 +157,8 @@ export function extractUserText(content: unknown): string {
  * 本地极速启发式提取（用于用户输入瞬间的即时预览）
  */
 export function generateFallbackTopic(text: string): string {
+    // 按码点切，否则 slice 会把 emoji 的代理对劈开，终端标题里留下孤立代理项
+    const cut = (s: string, n: number) => Array.from(s).slice(0, n).join("");
     const clean = text
         .replace(/\s+/g, " ")
         .replace(/^[\s\p{P}]+/u, "")
@@ -166,14 +168,12 @@ export function generateFallbackTopic(text: string): string {
 
     const splitMatch = clean.match(/^([^，,。！？!?；;\n]+)[，,。！？!?；;\n]\s*(.*)$/);
     if (splitMatch) {
-        const title = splitMatch[1].trim().slice(0, 10);
-        const desc = splitMatch[2].trim().slice(0, 25) || clean.slice(0, 25);
+        const title = cut(splitMatch[1].trim(), 10);
+        const desc = cut(splitMatch[2].trim(), 25) || cut(clean, 25);
         return `[${title} - ${desc}]`;
     }
 
-    const title = clean.slice(0, 8);
-    const desc = clean.slice(0, 24);
-    return `[${title} - ${desc}]`;
+    return `[${cut(clean, 8)} - ${cut(clean, 24)}]`;
 }
 
 /**
@@ -390,12 +390,16 @@ export function parseTopicXml(text: string): ParsedTopicBlock | null {
 }
 
 /**
- * 从回复文本中剥离 XML
- * 只删完整的 <topic> 块：裸的 <title>/<tools> 等标签可能是用户正在讨论的内容
+ * 从回复文本中剥离协议块
+ *
+ * 只删**末尾**那个 <topic> 块：协议本身要求它出现在回复最末（历史 139 次真实输出全在末尾），
+ * 而正文中间/代码围栏里的 <topic> 全是模型在讲解或举例（本项目自己的会话就有 7 次），
+ * 一刀切会把用户想看的示例一起删掉。
+ * 裸的 <title>/<tools> 等标签同样不碰。
  */
 export function stripTopicXmlFromText(text: string): string {
     if (!text) return "";
-    return text.replace(/<topic[\s\S]*?<\/topic>/gi, "").trimEnd();
+    return text.replace(/\s*<topic[\s\S]*?<\/topic>\s*$/i, "").trimEnd();
 }
 
 /**
@@ -510,10 +514,10 @@ At the very end of your final answer, on a new line, output:
 Rules:
 - <title> & <description>: summarize current session in Chinese.
 - <mode>: broad intent category for mental focus (e.g. ${modes && Object.keys(modes).length > 0 ? Object.keys(modes).join(", ") : "code, academic, ppt, ops, general"}).${modeLines}
-- <tools> & <skills>: freely choose ANY tools and skills you need from the full available list below. You can freely mix tools across domains.
-- Available Tools Pool: [${availableTools.join(", ")}]
-- Available Skills Pool: [${availableSkills.join(", ")}]
-- This rule applies to this turn only; Don't add any topic information in the latter turn
+- <tools> & <skills>: 下面两张表里是**还没激活**的额外项，按需选；不选也行（已激活的项照旧保留，不必重列）。
+- Tools not yet active: [${availableTools.join(", ") || "none"}]
+- Skills not yet loaded: [${availableSkills.join(", ") || "none"}]
+- Output it exactly once, in the first assistant reply of this session. This instruction is not repeated, so never emit <topic> again.
 `;
 }
 
@@ -783,16 +787,23 @@ export default function (pi: ExtensionAPI) {
         tools: string[],
         skills: string[],
         notify = false,
-        ctx?: ExtensionContext
+        ctx?: ExtensionContext,
+        // 模型改选时是否保留已激活的能力：池子里不再重复列出已加载项，
+        // 所以这里必须累加，否则模型没重新点名的那几项会被静默丢掉
+        mergeActive = false
     ) {
         currentTopic = topic;
         currentMode = mode || "general";
-        activeSkills = new Set(skills.map((s) => s.toLowerCase()));
-        activeSkillInstructions = loadSkillInstructions(skills);
+        const requestedSkills = skills.map((s) => s.toLowerCase());
+        activeSkills = mergeActive
+            ? new Set([...activeSkills, ...requestedSkills])
+            : new Set(requestedSkills);
+        activeSkillInstructions = loadSkillInstructions(Array.from(activeSkills));
         routingApplied = true;
 
         // 合并基础工具与模型自选工具
-        const mergedTools = Array.from(new Set([...config.baseTools, ...tools]));
+        const keep = mergeActive ? pi.getActiveTools() : [];
+        const mergedTools = Array.from(new Set([...keep, ...config.baseTools, ...tools]));
         pi.setActiveTools(mergedTools);
 
         // 持久化到 Session 自定义 Entry
@@ -800,8 +811,8 @@ export default function (pi: ExtensionAPI) {
             pi.appendEntry(ENTRY_TYPE_TOPIC, {
                 topic,
                 mode: currentMode,
-                tools,
-                skills,
+                tools: mergedTools.filter((t) => !config.baseTools.includes(t)),
+                skills: Array.from(activeSkills),
             });
         } catch {
             // ignore
@@ -812,7 +823,7 @@ export default function (pi: ExtensionAPI) {
 
         if (notify && ctx?.ui) {
             ctx.ui.notify(
-                `🎯 [${currentMode}] ${topic}\n激活工具: ${tools.join(", ") || "基础集"} | 技能: ${skills.join(", ") || "无"}`,
+                `🎯 [${currentMode}] ${topic}\n激活工具: ${mergedTools.filter((t) => !config.baseTools.includes(t)).join(", ") || "基础集"} | 技能: ${Array.from(activeSkills).join(", ") || "无"}`,
                 "info"
             );
         }
@@ -888,31 +899,38 @@ export default function (pi: ExtensionAPI) {
             const preview = generateFallbackTopic(event.text);
             setTerminalTitle(preview);
             sendHerdrTabRename(preview);
-
-            const allTools = pi.getAllTools().map((t) => t.name);
-            const nonBaseTools = allTools.filter((t) => !config.baseTools.includes(t));
-            const availableSkills = Array.from(discoveredSkillsMap.values()).map((s) => s.name);
-
-            const instruction = buildRoutingInstruction(
-                nonBaseTools.length > 0 ? nonBaseTools : allTools,
-                availableSkills,
-                config.modes
-            );
-
-            return {
-                action: "transform",
-                text: `${event.text}\n\n${instruction}`,
-            };
         }
 
         return { action: "continue" };
     });
 
+    /**
+     * 协议指令的承载位：system prompt。
+     * 不能挂在用户消息上 —— 用户消息会永久留在会话历史里，模型每轮都看得见“输出 <topic>”
+     * 那条指令，于是从第二轮起持续重复输出。system prompt 是每轮重建的，
+     * expectingTopic 一落就自然卸载，历史里不留痕。
+     */
+    function buildTurnSystemPrompt(basePrompt: string): string {
+        if (!expectingTopic) return basePrompt;
+        // 池子里只放“还没挂上的”：已加载的工具/system prompt 里已有的技能重复列出，
+        // 既浪费 token，也会诱使模型把它们再选一遍（对 tools 而言重复选择是无效动作）
+        const activeTools = pi.getActiveTools();
+        const extraTools = pi
+            .getAllTools()
+            .map((t) => t.name)
+            .filter((t) => !config.baseTools.includes(t) && !activeTools.includes(t));
+        const availableSkills = Array.from(discoveredSkillsMap.values())
+            .filter((s) => !activeSkills.has(s.name.toLowerCase()))
+            .map((s) => s.name);
+        const instruction = buildRoutingInstruction(extraTools, availableSkills, config.modes);
+        return `${basePrompt}\n\n${instruction}`;
+    }
+
     // 4. 发送给大模型前：过滤系统提示词，实现技能按需隔离注入
     pi.on("before_agent_start", async (event) => {
         // 只在「等待路由」或「路由已落地」时过滤技能。
         // 模型漏输出 <topic> 时两者皆假，原样放行，避免技能整个会话消失且无自愈
-        let systemPrompt = event.systemPrompt;
+        let systemPrompt = buildTurnSystemPrompt(event.systemPrompt);
         if (expectingTopic || routingApplied) {
             systemPrompt = filterSystemPromptSkills(systemPrompt, activeSkills);
         }
@@ -925,8 +943,11 @@ export default function (pi: ExtensionAPI) {
     });
 
     // 5. 模型回复结束：解析 XML 并动态调整工具与技能
+    // 解析只在「等待路由」时做；剥离则无条件 —— 首轮指令会永久留在上下文里，
+    // 模型后续轮次仍会照抄输出 <topic>，不剥掉既脏屏，又让模型从自己的历史里
+    // 学到「每轮都该输出」，把泄漏自我强化下去。
     pi.on("message_end", async (event, ctx) => {
-        if (!expectingTopic || event.message.role !== "assistant") return;
+        if (event.message.role !== "assistant") return;
 
         let parsedBlock: ParsedTopicBlock | null = null;
         let modified = false;
@@ -938,7 +959,7 @@ export default function (pi: ExtensionAPI) {
                     typeof (part.text || part.thinking) === "string"
                 ) {
                     const raw = part.text || part.thinking || "";
-                    if (!parsedBlock) {
+                    if (expectingTopic && !parsedBlock) {
                         parsedBlock = parseTopicXml(raw);
                     }
                 }
@@ -975,7 +996,8 @@ export default function (pi: ExtensionAPI) {
                     normalizedTools,
                     parsedBlock.skills,
                     true,
-                    ctx
+                    ctx,
+                    true
                 );
             }
 

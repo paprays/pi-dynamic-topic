@@ -12,6 +12,7 @@ import {
     discoverSkills,
     buildRoutingInstruction,
     DEFAULT_CONFIG,
+    generateFallbackTopic,
 } from "./index.ts";
 
 // Isolate tests from real user environment
@@ -308,12 +309,17 @@ assert.ok(!activeTools.includes("gdb-mcp_open"), "gdb must NOT be active in cold
 assert.ok(!activeTools.includes("lsp_diagnostics"), "lsp must NOT be active in cold start");
 console.log("  ✓ Lifecycle: Cold start activation passed");
 
-// 7.2 Turn 1 Input transform
+// 7.2 Turn 1 指令注入 system prompt（用户文本不被污染）
 const inputResult1 = await eventHandlers.get("input")({ text: "帮我用 gdb 排查这个 c++ 错误" }, mockCtx);
-assert.equal(inputResult1.action, "transform", "Turn 1 must transform input prompt");
-assert.ok(inputResult1.text.includes("[Session Topic & Capability Routing (this turn ONLY)]"));
-assert.ok(inputResult1.text.includes("gdb-mcp_open"));
-console.log("  ✓ Lifecycle: Turn 1 prompt transform passed");
+assert.equal(inputResult1.action, "continue", "Turn 1 must NOT rewrite user text");
+const turn1Prompt = await eventHandlers.get("before_agent_start")(
+    { systemPrompt: "BASE_PROMPT" },
+    mockCtx
+);
+assert.ok(turn1Prompt.systemPrompt.includes("[Session Topic & Capability Routing (this turn ONLY)]"));
+assert.ok(turn1Prompt.systemPrompt.includes("gdb-mcp_open"));
+assert.ok(turn1Prompt.systemPrompt.startsWith("BASE_PROMPT"), "Isolate: 原 system prompt 必须保留在前");
+console.log("  ✓ Lifecycle: Turn 1 system-prompt injection passed");
 
 // 7.3 Assistant Message End with XML Response
 const assistantMsg = {
@@ -492,7 +498,9 @@ assert.ok(coerced.modes && typeof coerced.modes === "object");
         await h.ev.get("session_start")({}, h.ctx);
         assert.ok(Array.isArray(h.tools()) && h.tools().length > 0, "baseTools must be applied");
         const r = await h.ev.get("input")({ text: "第一条消息" }, h.ctx);
-        assert.equal(r.action, "transform", "input hook must not throw on a partial config");
+        assert.equal(r.action, "continue", "input hook must not throw on a partial config");
+        const sp = await h.ev.get("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
+        assert.ok(sp.systemPrompt.includes("Capability Routing"), "partial config 仍须注入指令");
     } finally {
         process.chdir(prev);
         fs.rmSync(partialProj, { recursive: true, force: true });
@@ -559,12 +567,40 @@ assert.ok(!sanitizeTitle("x\x1b]0;y\x07").includes("\x07"), "BEL must be strippe
 }
 console.log("  ✓ 8.6 Terminal title is sanitized before OSC write (end-to-end)");
 
+// 8.6b 启发式标题按码点截断，不得把 emoji 劈成孤立代理项
+{
+    const emojiTitle = generateFallbackTopic("aaaaaaaaa😀bbbb 帮我看看这个崩溃");
+    assert.ok(
+        !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(emojiTitle),
+        `标题不得含孤立代理项: ${JSON.stringify(emojiTitle)}`
+    );
+    assert.equal(generateFallbackTopic("，，，！！"), "新对话", "纯标点回落到占位标题");
+}
+console.log("  ✓ 8.6b Fallback title cuts by code point");
+
 // 8.7 只剥 <topic> 块，不得吃掉用户正在讨论的 <title>
 const htmlTalk = "这样写：\n<title>My Page</title>\n就好了。\n<topic><title>网页标题</title><mode>general</mode></topic>";
 const keptHtml = stripTopicXmlFromText(htmlTalk);
 assert.ok(keptHtml.includes("<title>My Page</title>"), "unrelated HTML must survive");
 assert.ok(!keptHtml.includes("<topic>"), "topic block must still be stripped");
 console.log("  ✓ 8.7 Unrelated <title> survives stripping");
+
+// 8.7b 剥离只针对末尾协议块：讲解/举例里的块必须留着
+const fencedExample =
+    "格式就是这样：\n```xml\n<topic><title>示例</title><mode>code</mode></topic>\n```\n就这些。";
+assert.ok(
+    stripTopicXmlFromText(fencedExample).includes("<topic>"),
+    "代码围栏里的示例不得被删"
+);
+const inlineQuote = "协议要求输出 <topic><title>x</title></topic>，仅此而已。";
+assert.ok(stripTopicXmlFromText(inlineQuote).includes("<topic>"), "正文中间的引用不得被删");
+const trailingBlock =
+    "正文正文。\n<topic><title>标题</title><description>描述</description></topic>";
+assert.ok(!stripTopicXmlFromText(trailingBlock).includes("<topic>"), "末尾协议块必须删");
+assert.equal(stripTopicXmlFromText("<topic><title>a</title></topic>"), "", "整条就是协议块时删干净");
+const twoTrailing = "正文。\n<topic><title>a</title></topic>\n<topic><title>b</title></topic>";
+assert.ok(!stripTopicXmlFromText(twoTrailing).includes("<topic>"), "连续多个末尾块一并删");
+console.log("  ✓ 8.7b Trailing-only stripping (examples in prose survive)");
 
 // 8.8 模型漏输出 <topic> 时技能不得永久隐身
 {
@@ -574,7 +610,7 @@ console.log("  ✓ 8.7 Unrelated <title> survives stripping");
     await h.ev.get("session_start")({}, h.ctx);
     await h.ev.get("input")({ text: "q" }, h.ctx);
     const turn1 = await h.ev.get("before_agent_start")({ systemPrompt: SP }, h.ctx);
-    assert.ok(!turn1.systemPrompt.includes("ponytail"), "cold-start isolation must be preserved");
+    assert.ok(!turn1.systemPrompt.includes("<available_skills>"), "cold-start isolation must be preserved");
     await h.ev.get("message_end")(reply("我忘了输出 topic 块"), h.ctx);
     await h.ev.get("agent_end")({}, h.ctx);
     const turn2 = await h.ev.get("before_agent_start")({ systemPrompt: SP }, h.ctx);
