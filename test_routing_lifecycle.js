@@ -131,7 +131,7 @@ console.log("\n[Suite 2] 模板插值");
     const noModes = buildRoutingInstruction(["nu"], ["ponytail"], undefined);
     assert.ok(!noModes.includes("${"), "无 modes 时也必须插值");
     assert.ok(noModes.includes("code | academic | ppt | ops | general | custom"));
-    assert.ok(noModes.includes("[nu]") && noModes.includes("[ponytail]"));
+    assert.ok(noModes.includes("  * nu") && noModes.includes("  * ponytail"));
     ok("2.1 无 modes 时插值完整");
 
     const withModes = buildRoutingInstruction(["gdb-mcp_open"], ["deep-research"], {
@@ -430,7 +430,14 @@ console.log("\n[Suite 11] 能力池只列未激活项");
         fs.mkdirSync(d, { recursive: true });
         fs.writeFileSync(path.join(d, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} 说明\n---\n${name} 正文\n`);
     }
-    const line = (sp, prefix) => sp.split("\n").find((l) => l.startsWith(prefix)) || "";
+    // 池子是「表头行 + 若干 `  * name: desc` 行」，取整段
+    const line = (sp, prefix) => {
+        const lines = sp.split("\n");
+        const i = lines.findIndex((l) => l.startsWith(prefix));
+        if (i < 0) return "";
+        const end = lines.findIndex((l, j) => j > i && !l.startsWith("  * "));
+        return lines.slice(i, end < 0 ? undefined : end).join("\n");
+    };
 
     const h = harness();
     await h.start();
@@ -438,6 +445,7 @@ console.log("\n[Suite 11] 能力池只列未激活项");
     const cold = (await h.prompt()).systemPrompt;
     assert.ok(line(cold, "- Tools not yet active:").includes("gdb-mcp_open"), "冷启动：额外工具在池子里");
     assert.ok(line(cold, "- Skills not yet loaded:").includes("ponytail"), "冷启动：技能在池子里");
+    assert.ok(line(cold, "- Skills not yet loaded:").includes("* ponytail: ponytail 说明"), "技能带作用描述");
     ok("11.1 冷启动池子列出全部额外项");
 
     await h.reply(TOPIC_CODE); // 激活 gdb-mcp_open + ponytail

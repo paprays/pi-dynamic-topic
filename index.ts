@@ -301,12 +301,20 @@ export function discoverSkills(dirs: string[], depthLimit = 4): Map<string, Disc
             let description = "";
             const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
             if (fmMatch) {
-                const fmLines = fmMatch[1].split("\n");
-                for (const line of fmLines) {
+                const fmLines = fmMatch[1].split(/\r?\n/);
+                for (let i = 0; i < fmLines.length; i++) {
+                    const line = fmLines[i];
                     const colonIdx = line.indexOf(":");
-                    if (colonIdx > 0) {
+                    // 缩进行是上一个键的续行，不是新键
+                    if (colonIdx > 0 && !/^\s/.test(line)) {
                         const key = line.slice(0, colonIdx).trim();
-                        const val = line.slice(colonIdx + 1).trim().replace(/^["']|["']$/g, "");
+                        let val = line.slice(colonIdx + 1).trim().replace(/^["']|["']$/g, "");
+                        // ponytail: 只认 YAML 块标量 `>` / `|`，折成一行；完整 YAML 等真遇到再上解析器
+                        if (/^[>|][+-]?$/.test(val)) {
+                            const body: string[] = [];
+                            while (i + 1 < fmLines.length && /^(\s|$)/.test(fmLines[i + 1])) body.push(fmLines[++i].trim());
+                            val = body.filter(Boolean).join(" ");
+                        }
                         if (key === "name" && val) name = val;
                         if (key === "description" && val) description = val;
                     }
@@ -438,11 +446,29 @@ export function filterSystemPromptSkills(systemPrompt: string, activeSkillNames:
 }
 
 /**
+ * 能力池条目：名字 + 一句话作用。技能描述动辄上千字（带触发词），只留首句并截断
+ */
+export type PoolItem = string | { name: string; description?: string };
+
+function formatPool(items: PoolItem[]): string {
+    if (items.length === 0) return " none";
+    return items
+        .map((item) => {
+            const { name, description } = typeof item === "string" ? { name: item, description: "" } : item;
+            const first = (description || "").replace(/\s+/g, " ").trim().split(/(?<=[.。!?！？])\s/)[0];
+            const chars = Array.from(first);
+            const brief = chars.length > 100 ? `${chars.slice(0, 100).join("")}…` : first;
+            return `\n  * ${name}${brief ? `: ${brief}` : ""}`;
+        })
+        .join("");
+}
+
+/**
  * 构造首轮注入给 User Prompt 的协议指令
  */
 export function buildRoutingInstruction(
-    availableTools: string[],
-    availableSkills: string[],
+    availableTools: PoolItem[],
+    availableSkills: PoolItem[],
     modes?: Record<string, { description: string; recommendedTools: string[]; recommendedSkills: string[] }>
 ): string {
     const modeKeys =
@@ -480,8 +506,8 @@ Rules:
 - <title> & <description>: summarize current session in Chinese.
 - <mode>: broad intent category for mental focus (e.g. ${modes && Object.keys(modes).length > 0 ? Object.keys(modes).join(", ") : "code, academic, ppt, ops, general"}).${modeLines}
 - <tools> & <skills>: 下面两张表里是**还没激活**的额外项，按需选；不选也行（已激活的项照旧保留，不必重列）。
-- Tools not yet active: [${availableTools.join(", ") || "none"}]
-- Skills not yet loaded: [${availableSkills.join(", ") || "none"}]
+- Tools not yet active:${formatPool(availableTools)}
+- Skills not yet loaded:${formatPool(availableSkills)}
 - Output it exactly once, in the first assistant reply of this session. This instruction is not repeated, so never emit <topic> again.
 `;
 }
@@ -882,11 +908,11 @@ export default function (pi: ExtensionAPI) {
         const activeTools = pi.getActiveTools();
         const extraTools = pi
             .getAllTools()
-            .map((t) => t.name)
-            .filter((t) => !config.baseTools.includes(t) && !activeTools.includes(t));
+            .filter((t) => !config.baseTools.includes(t.name) && !activeTools.includes(t.name))
+            .map((t) => ({ name: t.name, description: t.description }));
         const availableSkills = Array.from(discoveredSkillsMap.values())
             .filter((s) => !activeSkills.has(s.name.toLowerCase()))
-            .map((s) => s.name);
+            .map((s) => ({ name: s.name, description: s.description }));
         const instruction = buildRoutingInstruction(extraTools, availableSkills, config.modes);
         return `${basePrompt}\n\n${instruction}`;
     }

@@ -200,8 +200,24 @@ fs.rmSync(tmpDir, { recursive: true, force: true });
 // ==========================================
 console.log("\n[Test 6] Routing Instruction Builder");
 const instruction = buildRoutingInstruction(["gdb-mcp_open", "nu"], ["ponytail", "academic-paper"]);
-assert.ok(instruction.includes("gdb-mcp_open, nu"));
-assert.ok(instruction.includes("ponytail, academic-paper"));
+assert.ok(instruction.includes("\n  * gdb-mcp_open\n  * nu"));
+assert.ok(instruction.includes("\n  * ponytail\n  * academic-paper"));
+const described = buildRoutingInstruction(
+    [{ name: "nu", description: "Run Nushell. Second sentence dropped." }],
+    [{ name: "long", description: "字".repeat(300) }]
+);
+assert.ok(described.includes("  * nu: Run Nushell.\n"), "工具带作用，只留首句");
+assert.ok(described.includes(`  * long: ${"字".repeat(100)}…`), "超长描述截到 100 字");
+{
+    // SKILL.md 的 description 常用 YAML 块标量（ponytail / pi-subagents），不能只读出一个 ">"
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fm-"));
+    fs.mkdirSync(path.join(root, "folded"));
+    fs.writeFileSync(
+        path.join(root, "folded", "SKILL.md"),
+        "---\nname: folded\ndescription: >\n  First line,\n  second line.\nlicense: MIT\n---\nbody\n"
+    );
+    assert.equal(discoverSkills([root]).get("folded")?.description, "First line, second line.");
+}
 assert.ok(instruction.includes("<topic>"));
 
 const instructionWithModes = buildRoutingInstruction(
