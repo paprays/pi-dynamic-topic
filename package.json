@@ -25,8 +25,5 @@
   "files": [
     "index.ts"
   ],
-  "license": "MIT",
-  "dependencies": {
-    "@xmldom/xmldom": "^0.9.12"
-  }
+  "license": "MIT"
 }

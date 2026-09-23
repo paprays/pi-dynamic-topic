@@ -602,6 +602,23 @@ const twoTrailing = "正文。\n<topic><title>a</title></topic>\n<topic><title>b
 assert.ok(!stripTopicXmlFromText(twoTrailing).includes("<topic>"), "连续多个末尾块一并删");
 console.log("  ✓ 8.7b Trailing-only stripping (examples in prose survive)");
 
+// 8.7c 正文提到 `<topic>` + 末尾真块（含空节点）：曾让 xmldom 死循环卡死 pi
+{
+    const reply =
+        "- 本会话首次回复末尾要输出一次 `<topic>` 结构化标签，之后不再输出。\n\n" +
+        "<topic>\n  <title>提示词解读</title>\n  <description>说明约束</description>\n" +
+        "  <mode>general</mode>\n  <tools></tools>\n  <skills></skills>\n</topic>";
+    const p = parseTopicXml(reply);
+    assert.equal(p?.title, "提示词解读", "取末尾完整块，不被正文里的 `<topic>` 带偏");
+    assert.deepEqual([p.tools, p.skills], [[], []], "空节点 → 空列表");
+    assert.equal(
+        stripTopicXmlFromText(reply),
+        "- 本会话首次回复末尾要输出一次 `<topic>` 结构化标签，之后不再输出。",
+        "只剥末尾块，正文那行完整保留"
+    );
+}
+console.log("  ✓ 8.7c Prose mention of `<topic>` before the real block");
+
 // 8.8 模型漏输出 <topic> 时技能不得永久隐身
 {
     const skillDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-skill-"));

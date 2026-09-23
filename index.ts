@@ -3,7 +3,6 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { DOMParser } from "@xmldom/xmldom";
 
 const HERDR_ENV = process.env.HERDR_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
@@ -12,6 +11,8 @@ const socketEndpoint =
 const tabId = process.env.HERDR_TAB_ID;
 
 const ENTRY_TYPE_TOPIC = "dynamic-topic-state";
+// 一个 <topic> 块，内部不得再出现 <topic —— 否则正文里提到的 `<topic>` 会和末尾真块连成一个坏块
+const TOPIC_BLOCK = String.raw`<topic\b[^>]*>(?:(?!<topic\b)[\s\S])*?<\/topic>`;
 
 export interface DynamicTopicConfig {
     version: number;
@@ -325,68 +326,32 @@ export function discoverSkills(dirs: string[], depthLimit = 4): Map<string, Disc
 }
 
 /**
- * 使用 W3C DOMParser 标准解析 <topic> 结构
+ * 从回复里取最后一个完整的 <topic> 块并抽出各字段
  */
 export function parseTopicXml(text: string): ParsedTopicBlock | null {
     if (!text) return null;
-    const match = text.match(/<topic[\s\S]*?<\/topic>/i);
-    if (!match) return null;
+    // ponytail: 正则代替 DOMParser —— 格式固定、只取文本。xmldom 在 pi 的 jiti 冷缓存（扩展刚改过/刚升级）下
+    // 会被加载成多份，sax 里 `instanceof ParseError` 失效，遇到不闭合的 <topic> 就在 position() 里死循环，整个 pi 卡死
+    const blocks = text.match(new RegExp(TOPIC_BLOCK, "gi"));
+    if (!blocks) return null;
+    const rawBlock = blocks[blocks.length - 1];
 
-    const rawBlock = match[0];
-    try {
-        const parser = new DOMParser({
-            onError: () => {},
-        } as any);
-        const doc = parser.parseFromString(rawBlock, "text/xml");
+    const texts = (tag: string) =>
+        [...rawBlock.matchAll(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`, "gi"))].map((m) =>
+            m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1").replace(/<[^>]*>/g, "").trim()
+        );
+    const list = (tag: string) => texts(tag).flatMap((v) => v.split(/[\s,]+/)).filter(Boolean);
+    const tools = list("tool");
+    const skills = list("skill");
 
-        const getFirstText = (tag: string) =>
-            doc.getElementsByTagName(tag)[0]?.textContent?.trim() || "";
-
-        const getAllTexts = (tag: string) => {
-            const nodes = doc.getElementsByTagName(tag);
-            const results: string[] = [];
-            for (let i = 0; i < nodes.length; i++) {
-                const val = nodes[i].textContent?.trim();
-                if (val) {
-                    for (const sub of val.split(/[\s,]+/)) {
-                        if (sub.trim()) results.push(sub.trim());
-                    }
-                }
-            }
-            return results;
-        };
-
-        const title = getFirstText("title").replace(/^\[|\]$/g, "").trim();
-        const description = getFirstText("description").replace(/^\[|\]$/g, "").trim();
-        const mode = getFirstText("mode").trim() || "general";
-
-        let tools = getAllTexts("tool");
-        if (tools.length === 0) {
-            const toolsContainer = getFirstText("tools");
-            if (toolsContainer) {
-                tools = toolsContainer.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-            }
-        }
-
-        let skills = getAllTexts("skill");
-        if (skills.length === 0) {
-            const skillsContainer = getFirstText("skills");
-            if (skillsContainer) {
-                skills = skillsContainer.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-            }
-        }
-
-        return {
-            title,
-            description,
-            mode,
-            tools,
-            skills,
-            rawBlock,
-        };
-    } catch {
-        return null;
-    }
+    return {
+        title: (texts("title")[0] || "").replace(/^\[|\]$/g, "").trim(),
+        description: (texts("description")[0] || "").replace(/^\[|\]$/g, "").trim(),
+        mode: texts("mode")[0] || "general",
+        tools: tools.length ? tools : list("tools"),
+        skills: skills.length ? skills : list("skills"),
+        rawBlock,
+    };
 }
 
 /**
@@ -399,7 +364,7 @@ export function parseTopicXml(text: string): ParsedTopicBlock | null {
  */
 export function stripTopicXmlFromText(text: string): string {
     if (!text) return "";
-    return text.replace(/\s*<topic[\s\S]*?<\/topic>\s*$/i, "").trimEnd();
+    return text.replace(new RegExp(String.raw`(?:\s*${TOPIC_BLOCK})+\s*$`, "i"), "").trimEnd();
 }
 
 /**
