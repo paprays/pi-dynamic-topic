@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
@@ -507,6 +508,60 @@ export function patchList(current: string[], delta?: string[]): string[] {
     const drop = new Set(delta.filter((d) => d.startsWith("-")).map((d) => d.slice(1)));
     const add = delta.filter((d) => !d.startsWith("-")).map((d) => d.replace(/^\+/, ""));
     return Array.from(new Set([...current.filter((x) => !drop.has(x)), ...add]));
+}
+
+const MODE_SUBS = ["list", "add", "edit", "del", "init"];
+const TOPIC_SUBS = ["update", "init", "mode"];
+
+/**
+ * /mode 与 /topic 的参数补全。
+ * pi 传进来的 prefix 是命令名之后到光标的整段文本，选中项的 value 会替换整段，
+ * 所以 value 必须带上前面已输入的部分。
+ */
+export function completeCommandArgs(
+    cmd: "mode" | "topic",
+    prefix: string,
+    env: { modes: string[]; tools: string[]; skills: string[] }
+): AutocompleteItem[] | null {
+    const parts = prefix.replace(/^\s+/, "").split(/\s+/);
+    const cur = parts[parts.length - 1];
+    const head = parts.slice(0, -1).join(" ");
+    const join = (v: string) => (head ? `${head} ${v}` : v);
+    // done 是当前词里已完成的前缀（逗号列表的前几项），只拿剩下的部分去匹配
+    const pick = (cands: string[], done = "") => {
+        const rest = cur.slice(done.length);
+        const items = cands.filter((c) => c.startsWith(rest)).map((c) => ({ value: join(done + c), label: c }));
+        return items.length ? items : null;
+    };
+    // 逗号列表：补最后一项，保留已输入的前几项和 +/- 前缀
+    const pickList = (cands: string[]) => {
+        const done = cur.slice(0, cur.lastIndexOf(",") + 1);
+        const sign = /^[+-]/.test(cur.slice(done.length)) ? cur[done.length] : "";
+        return pick(cands.map((c) => sign + c), done);
+    };
+
+    const sub = parts[0];
+    const prev = parts[parts.length - 2];
+    if (cmd === "topic") {
+        if (parts.length === 1) return pick(TOPIC_SUBS);
+        if (sub === "mode") {
+            const inner = completeCommandArgs("mode", parts.slice(1).join(" "), env);
+            return inner ? inner.map((i) => ({ ...i, value: `mode ${i.value}` })) : null;
+        }
+        if (sub === "init") return pick(["--project"]);
+        if (sub !== "update") return null;
+    } else {
+        if (parts.length === 1) return pick([...MODE_SUBS, ...env.modes]);
+        if (sub === "init") return pick(["--project"]);
+        if ((sub === "edit" || sub === "del") && parts.length === 2) return pick(env.modes);
+        if (sub !== "add" && sub !== "edit") return null;
+    }
+    // 标志及其取值
+    if (prev === "--tools" || prev === "-t") return pickList(env.tools);
+    if (prev === "--skills" || prev === "-s") return pickList(env.skills);
+    if (prev === "--mode" || prev === "-m") return pick(env.modes);
+    if (cur.startsWith("-")) return pick(cmd === "topic" ? ["--mode", "--tools", "--skills"] : ["--tools", "--skills", "--desc"]);
+    return null;
 }
 
 /**
@@ -1090,8 +1145,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     // 7. 注册 /mode 与 /topic 命令
+    const completionEnv = () => ({
+        modes: Object.keys(config.modes),
+        tools: allToolNames(),
+        skills: knownSkills.map((s) => s.name),
+    });
+
     pi.registerCommand("mode", {
         description: "模式管理 (增删改列与切换): /mode [list | add | del | edit | init | <name>]",
+        getArgumentCompletions: (prefix) => completeCommandArgs("mode", prefix, completionEnv()),
         handler: async (args, ctx) => {
             await handleModeOperation(args, ctx);
         },
@@ -1099,6 +1161,7 @@ export default function (pi: ExtensionAPI) {
 
     pi.registerCommand("topic", {
         description: "会话主题与能力: /topic [update [...] | init | mode ... | [标题 - 描述]]",
+        getArgumentCompletions: (prefix) => completeCommandArgs("topic", prefix, completionEnv()),
         handler: async (args, ctx) => {
             const trimmed = args.trim();
 

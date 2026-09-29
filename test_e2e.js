@@ -436,7 +436,7 @@ console.log("  ✓ Command: /mode del passed");
 console.log("\n[Test 8] Audit Regressions");
 
 import ext from "./index.ts";
-import { parseModeArgs, coerceConfig, sanitizeTitle } from "./index.ts";
+import { parseModeArgs, coerceConfig, sanitizeTitle, completeCommandArgs } from "./index.ts";
 
 const REG_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_search",
     "ask_user", "fetch_content", "get_search_content", "gdb-mcp_open", "lsp_diagnostics",
@@ -633,6 +633,32 @@ console.log("  ✓ 8.7c Prose mention of `<topic>` before the real block");
     fs.rmSync(skillDir, { recursive: true, force: true });
 }
 console.log("  ✓ 8.8 Skills recover when the model omits <topic>");
+
+// 8.9 参数补全：value 替换整段参数，所以必须带上已输入的前缀
+{
+    const env = { modes: ["code", "ops"], tools: ["nu", "ast_search"], skills: ["ponytail", "deep-research"] };
+    const vals = (cmd, p) => (completeCommandArgs(cmd, p, env) || []).map((i) => i.value);
+    assert.deepEqual(vals("mode", ""), ["list", "add", "edit", "del", "init", "code", "ops"]);
+    assert.deepEqual(vals("mode", "e"), ["edit"]);
+    assert.deepEqual(vals("mode", "edit "), ["edit code", "edit ops"]);
+    assert.deepEqual(vals("mode", "del o"), ["del ops"]);
+    assert.deepEqual(vals("mode", "init "), ["init --project"]);
+    assert.deepEqual(vals("mode", "add rev 逆向 --"), ["add rev 逆向 --tools", "add rev 逆向 --skills", "add rev 逆向 --desc"]);
+    assert.deepEqual(vals("mode", "add rev --tools nu,a"), ["add rev --tools nu,ast_search"]);
+    assert.deepEqual(vals("mode", "add rev --skills "), ["add rev --skills ponytail", "add rev --skills deep-research"]);
+    assert.equal(completeCommandArgs("mode", "code ", env), null, "切换模式后面没有参数");
+    assert.equal(completeCommandArgs("mode", "zzz", env), null, "无匹配返回 null");
+
+    assert.deepEqual(vals("topic", ""), ["update", "init", "mode"]);
+    assert.deepEqual(vals("topic", "mode ed"), ["mode edit"]);
+    assert.deepEqual(vals("topic", "mode edit c"), ["mode edit code"]);
+    assert.deepEqual(vals("topic", "update 换个活 --m"), ["update 换个活 --mode"]);
+    assert.deepEqual(vals("topic", "update --mode "), ["update --mode code", "update --mode ops"]);
+    assert.deepEqual(vals("topic", "update --tools +nu,-a"), ["update --tools +nu,-ast_search"], "保留 +/- 前缀");
+    assert.deepEqual(vals("topic", "update -s p"), ["update -s ponytail"]);
+    assert.equal(completeCommandArgs("topic", "自定义标题 - 描述", env), null, "自由文本不弹补全");
+}
+console.log("  ✓ 8.9 Argument completions for /mode and /topic");
 
 fs.rmSync(isolatedDir, { recursive: true, force: true });
 

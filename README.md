@@ -31,6 +31,9 @@ pi install git:github.com/paprays/pi-dynamic-topic
 /topic update 新主题 - 描述 --mode ppt --tools +generate_image,-nu --skills deep-research,-ponytail
 ```
 
+Both commands have Tab completion for subcommands, mode names, flags, and the values of
+`--mode` / `--tools` / `--skills` (comma lists and `+`/`-` prefixes included).
+
 `/topic update` with arguments applies in place. Every part is optional and omitted parts keep
 their current value. In `--tools` / `--skills`, `name` or `+name` adds and `-name` removes.
 
