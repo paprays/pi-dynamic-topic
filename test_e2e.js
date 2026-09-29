@@ -9,7 +9,7 @@ import {
     normalizeTools,
     filterSystemPromptSkills,
     loadConfig,
-    discoverSkills,
+    parseAvailableSkills,
     buildRoutingInstruction,
     DEFAULT_CONFIG,
     generateFallbackTopic,
@@ -209,14 +209,10 @@ const described = buildRoutingInstruction(
 assert.ok(described.includes("  * nu: Run Nushell.\n"), "工具带作用，只留首句");
 assert.ok(described.includes(`  * long: ${"字".repeat(100)}…`), "超长描述截到 100 字");
 {
-    // SKILL.md 的 description 常用 YAML 块标量（ponytail / pi-subagents），不能只读出一个 ">"
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fm-"));
-    fs.mkdirSync(path.join(root, "folded"));
-    fs.writeFileSync(
-        path.join(root, "folded", "SKILL.md"),
-        "---\nname: folded\ndescription: >\n  First line,\n  second line.\nlicense: MIT\n---\nbody\n"
-    );
-    assert.equal(discoverSkills([root]).get("folded")?.description, "First line, second line.");
+    // 技能集直接从 pi 的 system prompt 读，不自己扫盘；pi 会做 XML 转义
+    const sp = "x\n<available_skills>\n  <skill>\n    <name>a-b</name>\n    <description>Uses &lt;tag&gt; &amp; more</description>\n    <location>/p/SKILL.md</location>\n  </skill>\n  <skill><name></name></skill>\n</available_skills>\ny";
+    assert.deepEqual(parseAvailableSkills(sp), [{ name: "a-b", description: "Uses <tag> & more" }]);
+    assert.deepEqual(parseAvailableSkills("no skills here"), []);
 }
 assert.ok(instruction.includes("<topic>"));
 
@@ -287,6 +283,7 @@ const mockCtx = {
         notify: (msg, level) => {
             notifiedMessages.push({ msg, level });
         },
+        setTitle: () => {},
     },
     model: { id: "test-model" },
     modelRegistry: {
@@ -414,7 +411,7 @@ console.log("  ✓ Command: /mode list passed");
 // 7.10 /mode add
 await commands.get("mode").handler("add review 代码安全审计与重构 --tools ast_search --skills ponytail-review", mockCtx);
 assert.ok(notifiedMessages.some((m) => m.msg.includes("成功添加模式 [review]")));
-assert.ok(notifiedMessages.some((m) => m.level === "success"));
+assert.ok(notifiedMessages.some((m) => m.level === "info"));
 
 // Switch to the newly added mode
 await commands.get("mode").handler("review", mockCtx);
@@ -447,7 +444,7 @@ const REG_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls", "web_s
 
 function regHarness(cwd) {
     let tools = [];
-    const ev = new Map(), cmds = new Map(), notes = [];
+    const ev = new Map(), cmds = new Map(), notes = [], titles = [];
     ext({
         getAllTools: () => REG_TOOLS.map((name) => ({ name })),
         getActiveTools: () => tools,
@@ -460,11 +457,11 @@ function regHarness(cwd) {
     const ctx = {
         cwd,
         sessionManager: { getEntries: () => [] },
-        ui: { notify: (msg, level) => notes.push({ msg, level }) },
+        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t) },
         model: { id: "m" },
         modelRegistry: { complete: async () => ({ role: "assistant", content: [] }) },
     };
-    return { ev, cmds, notes, ctx, tools: () => tools };
+    return { ev, cmds, notes, titles, ctx, tools: () => tools };
 }
 const reply = (text) => ({ message: { role: "assistant", content: [{ type: "text", text }] } });
 
@@ -553,35 +550,20 @@ console.log("  ✓ 8.5 Prototype keys rejected instead of crashing");
 assert.equal(sanitizeTitle("A\x07\x1b]0;PWNED\x07B"), "A  ]0;PWNED B");
 assert.ok(!sanitizeTitle("x\x1b]0;y\x07").includes("\x1b"), "ESC must be stripped");
 assert.ok(!sanitizeTitle("x\x1b]0;y\x07").includes("\x07"), "BEL must be stripped");
-// 闭环：模型输出的注入标题真正写到 stdout 时，必须只剩一条完整的 OSC 序列
+// 闭环：模型输出的标题交给 pi 的 ui.setTitle 之前必须已净化（不再自己写 OSC）
 {
     const oscDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-reg-osc-"));
-    const captured = [];
-    const realWrite = process.stdout.write.bind(process.stdout);
-    const realTTY = process.stdout.isTTY;
-    process.stdout.isTTY = true;
-    process.stdout.write = (chunk, ...rest) => {
-        if (typeof chunk === "string" && chunk.includes("\x1b]0;")) { captured.push(chunk); return true; }
-        return realWrite(chunk, ...rest);
-    };
-    try {
-        const h = regHarness(oscDir);
-        await h.ev.get("session_start")({}, h.ctx);
-        await h.ev.get("input")({ text: "q" }, h.ctx);
-        await h.ev.get("message_end")(reply(
-            "ok\n<topic><title>A\x07\x1b]0;PWNED\x07B</title><mode>general</mode></topic>"), h.ctx);
-    } finally {
-        process.stdout.write = realWrite;
-        process.stdout.isTTY = realTTY;
-        fs.rmSync(oscDir, { recursive: true, force: true });
-    }
-    assert.ok(captured.length > 0, "a title should have been written");
-    for (const w of captured) {
-        assert.equal(w.match(/\x1b\]0;/g).length, 1, "model must not be able to emit a second OSC sequence");
-        assert.equal(w.match(/\x07/g).length, 1, "model must not be able to emit a stray BEL");
-    }
+    const h = regHarness(oscDir);
+    await h.ev.get("session_start")({}, h.ctx);
+    await h.ev.get("input")({ text: "q" }, h.ctx);
+    await h.ev.get("message_end")(reply(
+        "ok\n<topic><title>A\x07\x1b]0;PWNED\x07B</title><mode>general</mode></topic>"), h.ctx);
+    fs.rmSync(oscDir, { recursive: true, force: true });
+    assert.ok(h.titles.length > 0, "a title should have been set");
+    assert.equal(h.titles.at(-1), "[A  ]0;PWNED B]");
+    for (const t of h.titles) assert.ok(!/[\x00-\x1f\x7f]/.test(t), "control chars must never reach setTitle");
 }
-console.log("  ✓ 8.6 Terminal title is sanitized before OSC write (end-to-end)");
+console.log("  ✓ 8.6 Terminal title is sanitized before ui.setTitle (end-to-end)");
 
 // 8.6b 启发式标题按码点截断，不得把 emoji 劈成孤立代理项
 {

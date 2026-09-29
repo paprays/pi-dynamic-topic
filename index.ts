@@ -88,20 +88,17 @@ export interface ParsedTopicBlock {
     rawBlock: string;
 }
 
-export interface DiscoveredSkill {
+export interface SkillInfo {
     name: string;
     description: string;
-    filePath: string;
 }
 
 /**
- * 设置终端窗口标题 (OSC 0 / OSC 2)
+ * 设置终端窗口标题：走 pi 自己的 ui.setTitle，不直接写 OSC（否则和 pi 的标题写入互相覆盖）
  */
-export function setTerminalTitle(title: string) {
-    if (process.stdout.isTTY) {
-        // 标题来自模型输出，必须剥掉控制字符，否则等于把 OSC 转义序列的控制权交给模型
-        process.stdout.write(`\x1b]0;${sanitizeTitle(title)}\x07`);
-    }
+export function setTerminalTitle(ctx: ExtensionContext, title: string) {
+    // 标题来自模型输出，必须剥掉控制字符，否则等于把 OSC 转义序列的控制权交给模型
+    ctx.ui.setTitle(sanitizeTitle(title));
 }
 
 /**
@@ -267,70 +264,27 @@ export function persistConfig(
     return targetPath;
 }
 
+const unescapeXml = (s: string) =>
+    s
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&amp;/g, "&");
+
 /**
- * 递归扫描技能文件（深度限制在4层以内以保证性能）
+ * 从 pi 生成的 system prompt 里读 <available_skills>。
+ * 这就是 pi 实际加载的技能集（settings 路径 + 包声明 + resources_discover），
+ * 自己扫目录会和它脱节，所以不扫。
  */
-export function discoverSkills(dirs: string[], depthLimit = 4): Map<string, DiscoveredSkill> {
-    const skills = new Map<string, DiscoveredSkill>();
-
-    function scan(dir: string, currentDepth: number) {
-        if (!fs.existsSync(dir) || currentDepth > depthLimit) return;
-        try {
-            const entries = fs.readdirSync(dir, { withFileTypes: true });
-            for (const entry of entries) {
-                if (entry.name === ".git" || (entry.name === "node_modules" && currentDepth > 0)) continue;
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                    const skillMd = path.join(fullPath, "SKILL.md");
-                    if (fs.existsSync(skillMd)) {
-                        parseSkillFile(skillMd, entry.name);
-                    } else {
-                        scan(fullPath, currentDepth + 1);
-                    }
-                }
-            }
-        } catch {
-            // ignore
-        }
-    }
-
-    function parseSkillFile(filePath: string, fallbackName: string) {
-        try {
-            const content = fs.readFileSync(filePath, "utf-8");
-            let name = fallbackName;
-            let description = "";
-            const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
-            if (fmMatch) {
-                const fmLines = fmMatch[1].split(/\r?\n/);
-                for (let i = 0; i < fmLines.length; i++) {
-                    const line = fmLines[i];
-                    const colonIdx = line.indexOf(":");
-                    // 缩进行是上一个键的续行，不是新键
-                    if (colonIdx > 0 && !/^\s/.test(line)) {
-                        const key = line.slice(0, colonIdx).trim();
-                        let val = line.slice(colonIdx + 1).trim().replace(/^["']|["']$/g, "");
-                        // ponytail: 只认 YAML 块标量 `>` / `|`，折成一行；完整 YAML 等真遇到再上解析器
-                        if (/^[>|][+-]?$/.test(val)) {
-                            const body: string[] = [];
-                            while (i + 1 < fmLines.length && /^(\s|$)/.test(fmLines[i + 1])) body.push(fmLines[++i].trim());
-                            val = body.filter(Boolean).join(" ");
-                        }
-                        if (key === "name" && val) name = val;
-                        if (key === "description" && val) description = val;
-                    }
-                }
-            }
-            skills.set(name.toLowerCase(), { name, description, filePath });
-        } catch {
-            // ignore
-        }
-    }
-
-    for (const d of dirs) {
-        scan(d, 0);
-    }
-
-    return skills;
+export function parseAvailableSkills(systemPrompt: string): SkillInfo[] {
+    const block = systemPrompt.match(/<available_skills>([\s\S]*?)<\/available_skills>/i)?.[1] || "";
+    return [...block.matchAll(/<skill>([\s\S]*?)<\/skill>/gi)].flatMap((m) => {
+        const field = (tag: string) =>
+            unescapeXml(m[1].match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, "i"))?.[1] || "").trim();
+        const name = field("name");
+        return name ? [{ name, description: field("description") }] : [];
+    });
 }
 
 /**
@@ -427,7 +381,8 @@ export function normalizeTools(
 }
 
 /**
- * 过滤并精简系统提示词中的技能列表，实现冷启动绝对隔离
+ * 过滤并精简系统提示词中的技能列表，实现冷启动绝对隔离。
+ * 留下的 <skill> 条目自带 <location>，模型需要时自己 read；技能正文不注入。
  */
 export function filterSystemPromptSkills(systemPrompt: string, activeSkillNames: Set<string>): string {
     return systemPrompt.replace(/<available_skills>([\s\S]*?)<\/available_skills>/gi, (_match, inner) => {
@@ -464,7 +419,7 @@ function formatPool(items: PoolItem[]): string {
 }
 
 /**
- * 构造首轮注入给 User Prompt 的协议指令
+ * 构造注入到 System Prompt 尾部的单轮协议指令
  */
 export function buildRoutingInstruction(
     availableTools: PoolItem[],
@@ -508,12 +463,12 @@ Rules:
 - <tools> & <skills>: 下面两张表里是**还没激活**的额外项，按需选；不选也行（已激活的项照旧保留，不必重列）。
 - Tools not yet active:${formatPool(availableTools)}
 - Skills not yet loaded:${formatPool(availableSkills)}
-- Output it exactly once, in the first assistant reply of this session. This instruction is not repeated, so never emit <topic> again.
+- Output it exactly once, at the end of this reply. This instruction is not repeated, so never emit <topic> again.
 `;
 }
 
 /**
- * 解析模式参数支持 --tools, --skills, --desc
+ * 解析命令参数：支持 --tools, --skills, --desc, --mode
  * 按 token 切分而非正则抠取：工具名/技能名里的连字符必须原样保留
  */
 export function parseModeArgs(rawArgs: string) {
@@ -524,6 +479,7 @@ export function parseModeArgs(rawArgs: string) {
     let tools: string[] | undefined;
     let skills: string[] | undefined;
     let desc: string | undefined;
+    let mode: string | undefined;
     const positional: string[] = [];
 
     for (let i = 0; i < tokens.length; i++) {
@@ -531,6 +487,7 @@ export function parseModeArgs(rawArgs: string) {
         if (t === "--tools" || t === "-t") tools = split(unquote(tokens[++i] || ""));
         else if (t === "--skills" || t === "-s") skills = split(unquote(tokens[++i] || ""));
         else if (t === "--desc" || t === "-d") desc = unquote(tokens[++i] || "");
+        else if (t === "--mode" || t === "-m") mode = unquote(tokens[++i] || "").toLowerCase() || undefined;
         else positional.push(unquote(t));
     }
 
@@ -539,7 +496,17 @@ export function parseModeArgs(rawArgs: string) {
         desc = positional.slice(1).join(" ");
     }
 
-    return { name, desc, tools, skills };
+    return { name, desc, tools, skills, mode, positional };
+}
+
+/**
+ * 增量列表：`-x` 移除，`x` / `+x` 添加；delta 为空则原样返回
+ */
+export function patchList(current: string[], delta?: string[]): string[] {
+    if (!delta) return current;
+    const drop = new Set(delta.filter((d) => d.startsWith("-")).map((d) => d.slice(1)));
+    const add = delta.filter((d) => !d.startsWith("-")).map((d) => d.replace(/^\+/, ""));
+    return Array.from(new Set([...current.filter((x) => !drop.has(x)), ...add]));
 }
 
 /**
@@ -562,13 +529,14 @@ export function formatModeList(modes: Record<string, any>, currentMode: string):
 }
 
 /**
- * 结合 AI 模型或启发式规则，自动分析环境并归纳生成模式配置
+ * 结合 AI 模型或启发式规则，自动分析环境并归纳生成模式配置。
+ * AI 失败时回退启发式，并把原因交给调用方提示（不再静默吞掉）。
  */
 export async function synthesizeConfigWithAi(
     allTools: { name: string; description?: string }[],
     allSkills: { name: string; description?: string }[],
     ctx?: ExtensionContext
-): Promise<DynamicTopicConfig> {
+): Promise<{ config: DynamicTopicConfig; aiError?: string }> {
     const baseTools = [
         "read",
         "bash",
@@ -641,9 +609,12 @@ export async function synthesizeConfigWithAi(
         },
     };
 
-    if (ctx?.modelRegistry && ctx?.model) {
-        try {
-            const prompt = `你是一个智能工具与技能架构专家。
+    if (!ctx?.modelRegistry || !ctx?.model) {
+        return { config: heuristicConfig, aiError: "当前没有可用模型" };
+    }
+
+    try {
+        const prompt = `你是一个智能工具与技能架构专家。
 请分析当前环境中已安装的全部工具（Tools）和技能（Skills）：
 
 【工具列表】
@@ -685,136 +656,120 @@ ${allSkills.map((s) => `- ${s.name}: ${s.description || "无说明"}`).join("\n"
   }
 }`;
 
-            const response = await ctx.modelRegistry.complete(
-                ctx.model,
-                {
-                    systemPrompt: "你是一个专业的系统配置生成器，只输出严格合法的 JSON 对象。",
-                    messages: [
-                        {
-                            role: "user",
-                            content: [{ type: "text", text: prompt }],
-                            timestamp: Date.now(),
-                        },
-                    ],
-                }
-            );
+        const registry: any = ctx.modelRegistry;
+        // ponytail: 测试桩把 complete 挂在 modelRegistry 上；真实 pi 没有这个方法，走 pi-ai 的 complete
+        const completeFn =
+            registry.complete ?? (await import("@earendil-works/pi-ai/compat")).complete;
+        const auth = registry.getApiKeyAndHeaders ? await registry.getApiKeyAndHeaders(ctx.model) : {};
+        if (auth.ok === false) throw new Error(auth.error);
 
-            const contentText = response.content
-                .filter((c: any) => c.type === "text")
-                .map((c: any) => c.text)
-                .join("\n");
+        const response = await completeFn(
+            ctx.model,
+            {
+                systemPrompt: "你是一个专业的系统配置生成器，只输出严格合法的 JSON 对象。",
+                messages: [
+                    {
+                        role: "user",
+                        content: [{ type: "text", text: prompt }],
+                        timestamp: Date.now(),
+                    },
+                ],
+            },
+            { apiKey: auth.apiKey, headers: auth.headers, env: auth.env }
+        );
 
-            const jsonMatch = contentText.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-                const parsed = JSON.parse(jsonMatch[0]);
-                if (parsed.modes && typeof parsed.modes === "object") {
-                    return {
-                        version: 1,
-                        baseTools,
-                        modes: {
-                            ...heuristicConfig.modes,
-                            ...parsed.modes,
-                        },
-                        customToolAliases: {
-                            ...heuristicConfig.customToolAliases,
-                            ...(parsed.customToolAliases || {}),
-                        },
-                    };
-                }
-            }
-        } catch {
-            // AI 请求失败或被取消时安全回退至启发式生成
-        }
+        const contentText = (response.content || [])
+            .filter((c: any) => c.type === "text")
+            .map((c: any) => c.text)
+            .join("\n");
+
+        const jsonMatch = contentText.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("模型没有返回 JSON");
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (!parsed.modes || typeof parsed.modes !== "object") throw new Error("返回的 JSON 缺少 modes");
+        return {
+            config: {
+                version: 1,
+                baseTools,
+                modes: {
+                    ...heuristicConfig.modes,
+                    ...parsed.modes,
+                },
+                customToolAliases: {
+                    ...heuristicConfig.customToolAliases,
+                    ...(parsed.customToolAliases || {}),
+                },
+            },
+        };
+    } catch (err: any) {
+        return { config: heuristicConfig, aiError: err?.message || String(err) };
     }
-
-    return heuristicConfig;
 }
 
 export default function (pi: ExtensionAPI) {
     let currentTopic: string | undefined;
     let currentMode: string = "general";
     let activeSkills = new Set<string>();
-    let activeSkillInstructions: string[] = [];
     let shouldInjectInNextPrompt = false;
     let expectingTopic = false;
     // 路由是否真的落过地。模型漏输出 <topic> 时必须放行全部技能，否则整个会话静默失能
     let routingApplied = false;
+    // 漏输出只重试一次，再漏就退化成普通 pi
+    let routingRetried = false;
     let config: DynamicTopicConfig = coerceConfig(DEFAULT_CONFIG);
-    let discoveredSkillsMap = new Map<string, DiscoveredSkill>();
+    // pi 实际加载的技能集，每轮从 system prompt 里读
+    let knownSkills: SkillInfo[] = [];
 
-    function refreshDiscoveredSkills(cwd: string) {
-        const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
-        const dirs = [
-            path.join(agentDir, "skills"),
-            path.join(os.homedir(), ".agents", "skills"),
-            path.join(cwd, ".pi", "skills"),
-            path.join(cwd, ".agents", "skills"),
-            path.join(agentDir, "git"),
-            path.join(agentDir, "npm", "node_modules"),
-        ];
-        discoveredSkillsMap = discoverSkills(dirs);
-    }
-
-    function loadSkillInstructions(skillsList: string[]): string[] {
-        const instructions: string[] = [];
-        for (const s of skillsList) {
-            const entry = discoveredSkillsMap.get(s.toLowerCase());
-            if (entry) {
-                try {
-                    const content = fs.readFileSync(entry.filePath, "utf-8");
-                    const clean = content.replace(/^---\r?\n[\s\S]*?\r?\n---/, "").trim();
-                    instructions.push(`### Skill: ${entry.name}\n${clean}`);
-                } catch {
-                    // ignore
-                }
-            }
-        }
-        return instructions;
-    }
+    const bracket = (s: string) => (s.startsWith("[") && s.endsWith("]") ? s : `[${s}]`);
+    const allToolNames = () => pi.getAllTools().map((t) => t.name);
 
     function applyTopic(
-        topic: string,
-        mode: string,
-        tools: string[],
-        skills: string[],
-        notify = false,
-        ctx?: ExtensionContext,
-        // 模型改选时是否保留已激活的能力：池子里不再重复列出已加载项，
-        // 所以这里必须累加，否则模型没重新点名的那几项会被静默丢掉
-        mergeActive = false
+        ctx: ExtensionContext,
+        opts: {
+            topic: string;
+            mode: string;
+            tools: string[];
+            skills: string[];
+            notify?: boolean;
+            // 模型改选时是否保留已激活的能力：池子里不再重复列出已加载项，
+            // 所以这里必须累加，否则模型没重新点名的那几项会被静默丢掉
+            merge?: boolean;
+            // 恢复会话时不再落库，否则每次 resume 都多一条相同记录
+            persist?: boolean;
+        }
     ) {
+        const { topic, mode, tools, skills, notify = false, merge = false, persist = true } = opts;
         currentTopic = topic;
         currentMode = mode || "general";
         const requestedSkills = skills.map((s) => s.toLowerCase());
-        activeSkills = mergeActive
-            ? new Set([...activeSkills, ...requestedSkills])
-            : new Set(requestedSkills);
-        activeSkillInstructions = loadSkillInstructions(Array.from(activeSkills));
+        activeSkills = merge ? new Set([...activeSkills, ...requestedSkills]) : new Set(requestedSkills);
         routingApplied = true;
 
         // 合并基础工具与模型自选工具
-        const keep = mergeActive ? pi.getActiveTools() : [];
+        const keep = merge ? pi.getActiveTools() : [];
         const mergedTools = Array.from(new Set([...keep, ...config.baseTools, ...tools]));
         pi.setActiveTools(mergedTools);
+        const extraTools = mergedTools.filter((t) => !config.baseTools.includes(t));
 
-        // 持久化到 Session 自定义 Entry
-        try {
-            pi.appendEntry(ENTRY_TYPE_TOPIC, {
-                topic,
-                mode: currentMode,
-                tools: mergedTools.filter((t) => !config.baseTools.includes(t)),
-                skills: Array.from(activeSkills),
-            });
-        } catch {
-            // ignore
+        if (persist) {
+            try {
+                pi.appendEntry(ENTRY_TYPE_TOPIC, {
+                    topic,
+                    mode: currentMode,
+                    tools: extraTools,
+                    skills: Array.from(activeSkills),
+                });
+            } catch {
+                // ignore
+            }
         }
 
-        setTerminalTitle(topic);
+        setTerminalTitle(ctx, topic);
         sendHerdrTabRename(topic);
 
-        if (notify && ctx?.ui) {
+        if (notify) {
             ctx.ui.notify(
-                `🎯 [${currentMode}] ${topic}\n激活工具: ${mergedTools.filter((t) => !config.baseTools.includes(t)).join(", ") || "基础集"} | 技能: ${Array.from(activeSkills).join(", ") || "无"}`,
+                `🎯 [${currentMode}] ${topic}\n激活工具: ${extraTools.join(", ") || "基础集"} | 技能: ${Array.from(activeSkills).join(", ") || "无"}`,
                 "info"
             );
         }
@@ -824,15 +779,14 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_start", async (_event, ctx) => {
         const cwd = process.cwd();
         config = loadConfig(cwd);
-        refreshDiscoveredSkills(cwd);
 
         currentTopic = undefined;
         currentMode = "general";
         activeSkills.clear();
-        activeSkillInstructions = [];
         shouldInjectInNextPrompt = false;
         expectingTopic = false;
         routingApplied = false;
+        routingRetried = false;
 
         const entries = ctx.sessionManager.getEntries();
         let savedState: any = null;
@@ -855,21 +809,23 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (savedState?.topic) {
-            applyTopic(
-                savedState.topic,
-                savedState.mode || "general",
-                savedState.tools || [],
-                savedState.skills || [],
-                false,
-                ctx
-            );
+            applyTopic(ctx, {
+                topic: savedState.topic,
+                mode: savedState.mode || "general",
+                tools: savedState.tools || [],
+                skills: savedState.skills || [],
+                persist: false,
+            });
             shouldInjectInNextPrompt = compactionPending;
         } else if (userMsgCount === 0) {
             pi.setActiveTools(config.baseTools);
             shouldInjectInNextPrompt = true;
         } else {
-            const fallback = generateFallbackTopic(firstUserText);
-            applyTopic(fallback, "general", [], [], false, ctx);
+            // 有历史但从没路由过（装插件前的旧会话 / 模型一直漏输出）：
+            // 只给标题，不动工具和技能 —— 就是普通 pi
+            currentTopic = generateFallbackTopic(firstUserText);
+            setTerminalTitle(ctx, currentTopic);
+            sendHerdrTabRename(currentTopic);
             shouldInjectInNextPrompt = compactionPending;
         }
     });
@@ -880,7 +836,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     // 3. 用户输入拦截 (Input Hook)
-    pi.on("input", async (event) => {
+    pi.on("input", async (event, ctx) => {
         if (!event.text) return { action: "continue" };
 
         if (shouldInjectInNextPrompt) {
@@ -888,7 +844,7 @@ export default function (pi: ExtensionAPI) {
             expectingTopic = true;
 
             const preview = generateFallbackTopic(event.text);
-            setTerminalTitle(preview);
+            setTerminalTitle(ctx, preview);
             sendHerdrTabRename(preview);
         }
 
@@ -910,101 +866,71 @@ export default function (pi: ExtensionAPI) {
             .getAllTools()
             .filter((t) => !config.baseTools.includes(t.name) && !activeTools.includes(t.name))
             .map((t) => ({ name: t.name, description: t.description }));
-        const availableSkills = Array.from(discoveredSkillsMap.values())
-            .filter((s) => !activeSkills.has(s.name.toLowerCase()))
-            .map((s) => ({ name: s.name, description: s.description }));
+        const availableSkills = knownSkills.filter((s) => !activeSkills.has(s.name.toLowerCase()));
         const instruction = buildRoutingInstruction(extraTools, availableSkills, config.modes);
         return `${basePrompt}\n\n${instruction}`;
     }
 
-    // 4. 发送给大模型前：过滤系统提示词，实现技能按需隔离注入
+    // 4. 发送给大模型前：过滤系统提示词，实现技能按需隔离
     pi.on("before_agent_start", async (event) => {
+        knownSkills = parseAvailableSkills(event.systemPrompt);
         // 只在「等待路由」或「路由已落地」时过滤技能。
         // 模型漏输出 <topic> 时两者皆假，原样放行，避免技能整个会话消失且无自愈
         let systemPrompt = buildTurnSystemPrompt(event.systemPrompt);
         if (expectingTopic || routingApplied) {
             systemPrompt = filterSystemPromptSkills(systemPrompt, activeSkills);
         }
-
-        if (activeSkillInstructions.length > 0) {
-            systemPrompt = `${systemPrompt}\n\n## Activated Skills Instructions\n${activeSkillInstructions.join("\n\n")}`;
-        }
-
         return { systemPrompt };
     });
 
     // 5. 模型回复结束：解析 XML 并动态调整工具与技能
-    // 解析只在「等待路由」时做；剥离则无条件 —— 首轮指令会永久留在上下文里，
-    // 模型后续轮次仍会照抄输出 <topic>，不剥掉既脏屏，又让模型从自己的历史里
-    // 学到「每轮都该输出」，把泄漏自我强化下去。
+    // 解析只在「等待路由」时做，且只看 text（thinking 里的是草稿）；剥离则无条件 ——
+    // 首轮指令会永久留在上下文里，模型后续轮次仍会照抄输出 <topic>，不剥掉既脏屏，
+    // 又让模型从自己的历史里学到「每轮都该输出」，把泄漏自我强化下去。
     pi.on("message_end", async (event, ctx) => {
         if (event.message.role !== "assistant") return;
+        if (!Array.isArray(event.message.content)) return;
 
         let parsedBlock: ParsedTopicBlock | null = null;
         let modified = false;
 
-        if (Array.isArray(event.message.content)) {
-            for (const part of event.message.content) {
-                if (
-                    (part.type === "text" || part.type === "thinking") &&
-                    typeof (part.text || part.thinking) === "string"
-                ) {
-                    const raw = part.text || part.thinking || "";
-                    if (expectingTopic && !parsedBlock) {
-                        parsedBlock = parseTopicXml(raw);
-                    }
-                }
-            }
+        const newContent = event.message.content.map((part: any) => {
+            if (part.type !== "text" || typeof part.text !== "string") return part;
+            if (expectingTopic && !parsedBlock) parsedBlock = parseTopicXml(part.text);
+            const stripped = stripTopicXmlFromText(part.text);
+            if (stripped === part.text) return part;
+            modified = true;
+            return { ...part, text: stripped };
+        });
 
-            const newContent = event.message.content.map((part: any) => {
-                if (part.type === "text" && typeof part.text === "string") {
-                    const stripped = stripTopicXmlFromText(part.text);
-                    if (stripped !== part.text) {
-                        modified = true;
-                        return { ...part, text: stripped };
-                    }
-                }
-                return part;
+        if (parsedBlock) {
+            expectingTopic = false;
+            const block: ParsedTopicBlock = parsedBlock;
+            applyTopic(ctx, {
+                topic: block.description ? `[${block.title} - ${block.description}]` : `[${block.title}]`,
+                mode: block.mode,
+                tools: normalizeTools(block.tools, allToolNames(), config.customToolAliases),
+                skills: block.skills,
+                notify: true,
+                merge: true,
             });
+        }
 
-            if (parsedBlock) {
-                expectingTopic = false;
-
-                const allRegisteredTools = pi.getAllTools().map((t) => t.name);
-                const normalizedTools = normalizeTools(
-                    parsedBlock.tools,
-                    allRegisteredTools,
-                    config.customToolAliases
-                );
-
-                const topicStr = parsedBlock.description
-                    ? `[${parsedBlock.title} - ${parsedBlock.description}]`
-                    : `[${parsedBlock.title}]`;
-
-                applyTopic(
-                    topicStr,
-                    parsedBlock.mode,
-                    normalizedTools,
-                    parsedBlock.skills,
-                    true,
-                    ctx,
-                    true
-                );
-            }
-
-            if (modified) {
-                return {
-                    message: {
-                        ...event.message,
-                        content: newContent,
-                    },
-                };
-            }
+        if (modified) {
+            return { message: { ...event.message, content: newContent } };
         }
     });
 
-    // 6. Agent 单轮结束重置锁
+    // 6. Agent 单轮结束：漏输出 <topic> 时重试一次，再漏就放开全部工具（普通 pi）
     pi.on("agent_end", async () => {
+        if (expectingTopic && !routingApplied) {
+            if (!routingRetried) {
+                routingRetried = true;
+                shouldInjectInNextPrompt = true;
+            } else {
+                pi.setActiveTools(allToolNames());
+            }
+        }
         expectingTopic = false;
     });
 
@@ -1027,20 +953,20 @@ export default function (pi: ExtensionAPI) {
         if (subCmd === "init") {
             const isProject = rest.includes("--project");
             const cwd = process.cwd();
-            refreshDiscoveredSkills(cwd);
 
-            ctx.ui.notify("🔍 正在扫描环境中的全部工具与技能，并由 AI 智能归纳模式...", "info");
+            if (knownSkills.length === 0) {
+                ctx.ui.notify("还没读到技能列表（先随便发一条消息再 init），本次只归纳工具", "warning");
+            }
+            ctx.ui.notify("🔍 正在归纳环境中的全部工具与技能...", "info");
 
-            const allTools = pi.getAllTools();
-            const allSkills = Array.from(discoveredSkillsMap.values());
-
-            const newConfig = await synthesizeConfigWithAi(allTools, allSkills, ctx);
+            const { config: newConfig, aiError } = await synthesizeConfigWithAi(pi.getAllTools(), knownSkills, ctx);
+            if (aiError) ctx.ui.notify(`AI 归纳失败，已改用名字启发式：${aiError}`, "warning");
             const savedPath = persistConfig(newConfig, cwd, isProject);
             config = newConfig;
             const modeKeys = Object.keys(newConfig.modes).join(", ");
             ctx.ui.notify(
                 `✅ 成功初始化工作模式配置至: ${savedPath}\n可用模式: [${modeKeys}]`,
-                "success"
+                "info"
             );
             return;
         }
@@ -1065,7 +991,7 @@ export default function (pi: ExtensionAPI) {
                 recommendedSkills: skills || [],
             };
             const savedPath = persistConfig(config, process.cwd());
-            ctx.ui.notify(`✅ 成功添加模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            ctx.ui.notify(`✅ 成功添加模式 [${name}] 并持久化至 ${savedPath}`, "info");
             return;
         }
 
@@ -1083,9 +1009,9 @@ export default function (pi: ExtensionAPI) {
             delete config.modes[name];
             const savedPath = persistConfig(config, process.cwd());
             if (currentMode === name) {
-                applyTopic(currentTopic || "[常规模式]", "general", [], [], true, ctx);
+                applyTopic(ctx, { topic: currentTopic || "[常规模式]", mode: "general", tools: [], skills: [], notify: true });
             }
-            ctx.ui.notify(`✅ 成功删除模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            ctx.ui.notify(`✅ 成功删除模式 [${name}] 并持久化至 ${savedPath}`, "info");
             return;
         }
 
@@ -1111,22 +1037,15 @@ export default function (pi: ExtensionAPI) {
             };
             const savedPath = persistConfig(config, process.cwd());
             if (currentMode === name) {
-                const allTools = pi.getAllTools().map((t) => t.name);
-                const normalized = normalizeTools(
-                    config.modes[name].recommendedTools,
-                    allTools,
-                    config.customToolAliases
-                );
-                applyTopic(
-                    currentTopic || `[模式更新 - ${name}]`,
-                    name,
-                    normalized,
-                    config.modes[name].recommendedSkills,
-                    true,
-                    ctx
-                );
+                applyTopic(ctx, {
+                    topic: currentTopic || `[模式更新 - ${name}]`,
+                    mode: name,
+                    tools: normalizeTools(config.modes[name].recommendedTools, allToolNames(), config.customToolAliases),
+                    skills: config.modes[name].recommendedSkills,
+                    notify: true,
+                });
             }
-            ctx.ui.notify(`✅ 成功修改模式 [${name}] 并持久化至 ${savedPath}`, "success");
+            ctx.ui.notify(`✅ 成功修改模式 [${name}] 并持久化至 ${savedPath}`, "info");
             return;
         }
 
@@ -1139,20 +1058,35 @@ export default function (pi: ExtensionAPI) {
             return;
         }
 
-        const allTools = pi.getAllTools().map((t) => t.name);
-        const normalized = normalizeTools(
-            modeConfig.recommendedTools,
-            allTools,
-            config.customToolAliases
-        );
-        applyTopic(
-            currentTopic || `[模式切换 - ${modeName}]`,
-            modeName,
-            normalized,
-            modeConfig.recommendedSkills,
-            true,
-            ctx
-        );
+        applyTopic(ctx, {
+            topic: currentTopic || `[模式切换 - ${modeName}]`,
+            mode: modeName,
+            tools: normalizeTools(modeConfig.recommendedTools, allToolNames(), config.customToolAliases),
+            skills: modeConfig.recommendedSkills,
+            notify: true,
+        });
+    }
+
+    /**
+     * /topic update：无参 → 下一轮让模型重新路由（累加）；
+     * 有参 → 就地增删：[标题 - 描述] [--mode m] [--tools +a,-b] [--skills +x,-y]
+     */
+    function handleTopicUpdate(rawArgs: string, ctx: ExtensionContext) {
+        if (!rawArgs) {
+            shouldInjectInNextPrompt = true;
+            ctx.ui.notify("下一条消息后由模型重新选择主题、模式、工具与技能（在现有基础上累加）", "info");
+            return;
+        }
+        const { positional, mode, tools, skills } = parseModeArgs(rawArgs);
+        const currentExtra = pi.getActiveTools().filter((t) => !config.baseTools.includes(t));
+        const text = positional.join(" ").trim();
+        applyTopic(ctx, {
+            topic: text ? bracket(text) : currentTopic || "[未命名]",
+            mode: mode || currentMode,
+            tools: normalizeTools(patchList(currentExtra, tools), allToolNames(), config.customToolAliases),
+            skills: patchList(Array.from(activeSkills), skills?.map((s) => s.toLowerCase())),
+            notify: true,
+        });
     }
 
     // 7. 注册 /mode 与 /topic 命令
@@ -1164,9 +1098,14 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.registerCommand("topic", {
-        description: "会话主题与模式管理: /topic [init | mode ... | [标题 - 描述]]",
+        description: "会话主题与能力: /topic [update [...] | init | mode ... | [标题 - 描述]]",
         handler: async (args, ctx) => {
             const trimmed = args.trim();
+
+            if (/^update\b/.test(trimmed)) {
+                handleTopicUpdate(trimmed.replace(/^update\s*/, ""), ctx);
+                return;
+            }
 
             if (trimmed.startsWith("mode")) {
                 const rest = trimmed.replace(/^mode\s*/, "");
@@ -1191,19 +1130,13 @@ export default function (pi: ExtensionAPI) {
             }
 
             // 手动设置主题
-            let newTopic = trimmed;
-            if (!newTopic.startsWith("[") || !newTopic.endsWith("]")) {
-                newTopic = `[${newTopic}]`;
-            }
-            const currentNonBase = pi.getActiveTools().filter((t) => !config.baseTools.includes(t));
-            applyTopic(
-                newTopic,
-                currentMode,
-                currentNonBase,
-                Array.from(activeSkills),
-                true,
-                ctx
-            );
+            applyTopic(ctx, {
+                topic: bracket(trimmed),
+                mode: currentMode,
+                tools: pi.getActiveTools().filter((t) => !config.baseTools.includes(t)),
+                skills: Array.from(activeSkills),
+                notify: true,
+            });
         },
     });
 }

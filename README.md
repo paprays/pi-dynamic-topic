@@ -7,10 +7,12 @@ A Pi extension that turns the first message of a session into two things at once
 1. **Cold start** — only `baseTools` are active. Skills are hidden from the system prompt.
 2. **First message** — a short routing instruction is appended to the **system prompt** (that turn only), listing the tools and skills that are not active yet. Your own message is never rewritten, and the instruction vanishes as soon as routing lands, so it cannot nudge later turns.
 3. **Model replies** — it ends with a `<topic>` block naming a title, description, mode, and the tools/skills it actually needs. A *trailing* block is stripped before rendering; blocks quoted mid-answer (e.g. inside code fences) are left alone.
-4. **Rest of the session** — the chosen tools are activated on top of `baseTools`, and only the chosen skills appear in the system prompt.
+4. **Rest of the session** — the chosen tools are activated on top of `baseTools`, and only the chosen skills appear in the system prompt. Skill bodies are never injected; the kept `<skill>` entries carry their `<location>` and the model reads them on demand, as in plain Pi.
 5. **After compaction** — step 2 repeats, so the topic and route follow what the session has become.
 
-If the model omits the `<topic>` block, routing is skipped and all skills stay visible — the session degrades to plain Pi rather than silently losing capabilities.
+If the model omits the `<topic>` block, the instruction is retried once on the next turn. If it is omitted again, all tools and skills are released — the session degrades to plain Pi rather than silently losing capabilities. Sessions that predate the plugin get a title only; their tools and skills are left untouched.
+
+The skill pool comes from the `<available_skills>` block Pi puts in the system prompt, so it always matches what Pi actually loaded (settings paths, packages, `resources_discover`).
 
 ## Install
 
@@ -25,7 +27,12 @@ pi install git:github.com/paprays/pi-dynamic-topic
 ```text
 /topic                          # show current topic, mode, active tools & skills
 /topic FastSort - 快排优化       # override the topic manually
+/topic update                   # next turn: let the model re-route (adds to what is active)
+/topic update 新主题 - 描述 --mode ppt --tools +generate_image,-nu --skills deep-research,-ponytail
 ```
+
+`/topic update` with arguments applies in place. Every part is optional and omitted parts keep
+their current value. In `--tools` / `--skills`, `name` or `+name` adds and `-name` removes.
 
 ### `/mode` — capability modes
 
@@ -78,12 +85,9 @@ Names that match nothing are dropped rather than guessed at.
 ## Development
 
 ```bash
-node test_e2e.js    # 8 suites, no framework — requires Node >= 22.18 for TS type stripping
+node test_e2e.js                # unit + command tests, no framework — requires Node >= 22.18
+node test_routing_lifecycle.js  # first turn / compact / resume / retry / /topic update
 ```
-
-Suite 8 covers the regressions from the repo audit: hyphenated mode arguments, config isolation,
-partial config files, tool-matching determinism, prototype-named modes, terminal-title sanitizing,
-`<title>` preservation, and skill recovery when the model omits `<topic>`.
 
 ## License
 

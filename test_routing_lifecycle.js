@@ -30,7 +30,7 @@ const TOOLS = [
 ];
 const HEADER = "[Session Topic & Capability Routing (this turn ONLY)]";
 const SP =
-    "前言\n<available_skills>\n<skill><name>ponytail</name></skill>\n<skill><name>deep-research</name></skill>\n</available_skills>\n后语";
+    "前言\n<available_skills>\n<skill><name>ponytail</name><description>ponytail 说明</description></skill>\n<skill><name>deep-research</name><description>deep-research 说明</description></skill>\n</available_skills>\n后语";
 const TOPIC_CODE =
     "搞定。\n<topic><title>调试</title><description>排查段错误</description>" +
     "<mode>code</mode><tools><tool>gdb-mcp_open</tool></tools>" +
@@ -49,6 +49,7 @@ function harness({ entries = [] } = {}) {
     const ev = new Map();
     const cmds = new Map();
     const notes = [];
+    const titles = [];
     const appended = [];
     ext({
         getAllTools: () => TOOLS.map((name) => ({ name })),
@@ -63,7 +64,7 @@ function harness({ entries = [] } = {}) {
     });
     const ctx = {
         sessionManager: { getEntries: () => entries },
-        ui: { notify: (msg, level) => notes.push({ msg, level }) },
+        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t) },
         model: { id: "test-model" },
         modelRegistry: { complete: async () => ({ role: "assistant", content: [] }) },
     };
@@ -71,6 +72,7 @@ function harness({ entries = [] } = {}) {
         ev,
         cmds,
         notes,
+        titles,
         appended,
         ctx,
         tools: () => tools,
@@ -269,19 +271,20 @@ console.log("\n[Suite 6] resume / fork");
     assert.ok(!sp.systemPrompt.includes("deep-research"), "未激活技能必须被过滤");
     ok("6.1 resume 恢复工具与技能，且不重复注入");
 
-    // ponytail: 恢复分支走 applyTopic，会再写一条 state entry（每次 resume +1）。
-    // 当前行为如此，此处只固定现状；若后续改成幂等写入，改这条断言即可。
-    assert.equal(h.appended.length, 1, "resume 会复写一条状态条目（当前行为）");
-    assert.equal(h.appended[0].type, "dynamic-topic-state");
-    assert.equal(h.appended[0].data.mode, "code");
-    ok("6.2 resume 复写状态条目");
+    // 回归：恢复分支曾每次 resume 都再写一条相同的 state entry（实测一个会话堆了 39 条）
+    assert.equal(h.appended.length, 0, "resume 不得重复落库");
+    assert.equal(h.titles.at(-1), "[调试 - 排查段错误]", "resume 恢复标题");
+    ok("6.2 resume 不重复落库");
 
+    // 回归：装插件前的旧会话曾被 applyTopic 清空技能、压回 baseTools，且不再路由
     const h2 = harness({ entries: [userMsg("旧会话第一问"), userMsg("旧会话第二问")] });
     await h2.start();
-    assert.deepEqual(h2.tools(), DEFAULT_CONFIG.baseTools, "无状态历史只能拿到基础工具");
+    assert.deepEqual(h2.tools(), [], "无状态历史不动工具集（保持 pi 默认）");
     assert.equal((await h2.input("继续")).action, "continue", "无状态历史不得注入");
+    assert.ok((await h2.prompt()).systemPrompt.includes("deep-research"), "无状态历史不得过滤技能");
     assert.equal(h2.notes.length, 0, "fallback 不应打扰用户");
-    ok("6.3 有历史但无状态：仅 fallback，不注入");
+    assert.ok(h2.titles.at(-1).includes("旧会话第一问"), "fallback 只给标题");
+    ok("6.3 有历史但无状态：只给标题，工具技能都不动");
 }
 
 // ==========================================
@@ -313,6 +316,16 @@ console.log("\n[Suite 7] 技能隔离与自愈");
     const healed = await h2.prompt();
     assert.ok(healed.systemPrompt.includes("ponytail"), "漏输出时技能必须回来");
     ok("7.2 漏输出 topic 后技能自愈");
+
+    // 漏输出后重试一次；再漏就放开全部工具（普通 pi）
+    await h2.input("第二问");
+    assert.ok((await h2.prompt()).systemPrompt.includes(HEADER), "漏输出后下一轮必须重试注入");
+    await h2.reply("又忘了");
+    await h2.end();
+    await h2.input("第三问");
+    assert.ok(!(await h2.prompt()).systemPrompt.includes(HEADER), "只重试一次");
+    assert.deepEqual([...h2.tools()].sort(), [...TOOLS].sort(), "放弃路由后放开全部工具");
+    ok("7.3 漏输出重试一次，再漏放开全部工具");
 }
 
 // ==========================================
@@ -425,11 +438,6 @@ console.log("\n[Suite 10] 后续轮次 topic 泄漏");
 // ==========================================
 console.log("\n[Suite 11] 能力池只列未激活项");
 {
-    for (const name of ["ponytail", "deep-research"]) {
-        const d = path.join(isolatedAgentDir, "skills", name);
-        fs.mkdirSync(d, { recursive: true });
-        fs.writeFileSync(path.join(d, "SKILL.md"), `---\nname: ${name}\ndescription: ${name} 说明\n---\n${name} 正文\n`);
-    }
     // 池子是「表头行 + 若干 `  * name: desc` 行」，取整段
     const line = (sp, prefix) => {
         const lines = sp.split("\n");
@@ -467,6 +475,43 @@ console.log("\n[Suite 11] 能力池只列未激活项");
         "没重新点名的已加载技能不得被静默丢掉"
     );
     ok("11.3 池子去重后改选是累加，不丢能力");
+}
+
+// ==========================================
+// Suite 12: /topic update
+// ==========================================
+console.log("\n[Suite 12] /topic update");
+{
+    const h = harness();
+    await h.start();
+    await h.input("第一问");
+    await h.reply(TOPIC_CODE); // gdb-mcp_open + ponytail
+    await h.end();
+    const topic = h.cmds.get("topic").handler;
+
+    await topic("update 换个活 - 现在改做图 --mode ppt --tools +generate_image,-gdb-mcp_open --skills deep-research,-ponytail", h.ctx);
+    assert.ok(h.tools().includes("generate_image") && !h.tools().includes("gdb-mcp_open"), "工具增删生效");
+    assert.deepEqual(h.appended.at(-1).data, {
+        topic: "[换个活 - 现在改做图]",
+        mode: "ppt",
+        tools: ["generate_image"],
+        skills: ["deep-research"],
+    });
+    const sp = (await h.prompt()).systemPrompt;
+    assert.ok(sp.includes("deep-research") && !sp.includes("<name>ponytail"), "技能增删生效");
+    ok("12.1 就地增删主题/模式/工具/技能");
+
+    await topic("update --tools nu", h.ctx);
+    assert.deepEqual(h.appended.at(-1).data.tools, ["generate_image", "nu"], "只给 --tools 时其余保持");
+    assert.equal(h.appended.at(-1).data.topic, "[换个活 - 现在改做图]");
+    ok("12.2 未给的字段保持原值");
+
+    await topic("update", h.ctx);
+    await h.input("再来");
+    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "无参 update → 下一轮让模型重路由");
+    await h.reply("<topic><title>补充</title><description>加个调试</description><mode>code</mode><tools><tool>gdb-mcp_open</tool></tools></topic>");
+    assert.ok(h.tools().includes("nu") && h.tools().includes("gdb-mcp_open"), "模型重路由是累加");
+    ok("12.3 无参 update 触发模型重路由");
 }
 
 fs.rmSync(isolatedAgentDir, { recursive: true, force: true });
