@@ -78,7 +78,19 @@ function harness({ entries = [] } = {}) {
         tools: () => tools,
         start: () => ev.get("session_start")({}, ctx),
         input: (text) => ev.get("input")({ text }, ctx),
-        prompt: () => ev.get("before_agent_start")({ systemPrompt: SP }, ctx),
+        // before_agent_start 只过滤技能；未过滤时返回 undefined，这里回退到原始 SP
+        prompt: async () => {
+            const r = await ev.get("before_agent_start")({ systemPrompt: SP }, ctx);
+            return { systemPrompt: r?.systemPrompt ?? SP };
+        },
+        // 路由指令现在走 context 事件注入到最后一条用户消息；
+        // 先跑 before_agent_start（设 knownSkills）再跑 context，返回模型看到的用户文本
+        routed: async (text = "问题") => {
+            await ev.get("before_agent_start")({ systemPrompt: SP }, ctx);
+            const r = await ev.get("context")({ messages: [{ role: "user", content: text }] }, ctx);
+            const um = (r?.messages ?? []).find((m) => m.role === "user");
+            return typeof um?.content === "string" ? um.content : "";
+        },
         reply: (text) => ev.get("message_end")(reply(text), ctx),
         end: () => ev.get("agent_end")({}, ctx),
         compact: () => ev.get("session_compact")({}, ctx),
@@ -100,28 +112,31 @@ console.log("\n[Suite 1] 首轮注入与单轮隔离");
 
     const q = "帮我用 gdb 排查这个 C++ 段错误";
     const r1 = await h.input(q);
-    assert.equal(r1.action, "continue", "用户文本不得被打扮：指令走 system prompt");
-    const injected = await h.prompt();
-    assert.ok(injected.systemPrompt.includes(HEADER), "必须带协议头");
-    assert.ok(injected.systemPrompt.includes("Tools not yet active"));
-    assert.ok(injected.systemPrompt.includes("gdb-mcp_open"), "池里必须有非基础工具");
-    assert.ok(!injected.systemPrompt.includes("${"), "模板必须完成插值");
-    ok("1.2 首轮经 system prompt 注入且模板已插值");
+    assert.equal(r1.action, "continue", "用户文本不得被打扮：指令走 context 注入");
+    const injected = await h.routed(q);
+    assert.ok(injected.includes(HEADER), "注入的用户消息必须带协议头");
+    assert.ok(injected.includes("Tools not yet active"));
+    assert.ok(injected.includes("gdb-mcp_open"), "池里必须有非基础工具");
+    assert.ok(!injected.includes("${"), "模板必须完成插值");
+    // 指令不能进 system prompt（否则 bridge 下被 projectCapture 丢掉）
+    const sp1 = await h.prompt();
+    assert.ok(!sp1.systemPrompt.includes(HEADER), "指令不得挂在 system prompt 上");
+    ok("1.2 首轮经 context 注入到用户消息且模板已插值");
 
     // 路由落地后，system prompt 必须立刻干净 —— 这是“后续轮次不再输出 topic”的根保障
     await h.reply(TOPIC_CODE);
     await h.end();
     await h.input("第二轮问题");
-    const second = await h.prompt();
-    assert.ok(!second.systemPrompt.includes(HEADER), "后续轮次不得再带指令块");
-    assert.ok(!second.systemPrompt.includes("Tools not yet active"));
+    const second = await h.routed("第二轮问题");
+    assert.ok(!second.includes(HEADER), "后续轮次不得再注入指令");
+    assert.ok(!second.includes("Tools not yet active"));
     ok("1.3 指令只活在首轮，落轮即卸载");
 
     const h2 = harness();
     await h2.start();
     assert.equal((await h2.input("")).action, "continue", "空文本本就无需注入");
     await h2.input("真正的第一句");
-    assert.ok((await h2.prompt()).systemPrompt.includes(HEADER), "空输入不得消费注入位");
+    assert.ok((await h2.routed("真正的第一句")).includes(HEADER), "空输入不消费注入位");
     ok("1.4 空文本输入不消费注入位");
 }
 
@@ -181,7 +196,7 @@ console.log("\n[Suite 3] 配置驱动的模式表");
             "只配 modes 时 baseTools 必须回落到默认值"
         );
         await h.input("随便问一句");
-        const injected = (await h.prompt()).systemPrompt;
+        const injected = await h.routed("随便问一句");
         assert.ok(injected.includes("Defined Modes & Defaults:"), "配置里的模式要以定义表形式注入");
         assert.ok(injected.includes("special:"));
         assert.ok(injected.includes("特化模式描述"));
@@ -208,7 +223,7 @@ console.log("\n[Suite 4] compact 重注入");
 
     await h.compact();
     await h.input("压缩后的第一句话");
-    const compressed = (await h.prompt()).systemPrompt;
+    const compressed = await h.routed("压缩后的第一句话");
     assert.ok(compressed.includes(HEADER), "compact 后必须重新注入");
     assert.ok(compressed.includes("Tools not yet active"));
     assert.ok(!compressed.includes("${"));
@@ -216,13 +231,13 @@ console.log("\n[Suite 4] compact 重注入");
     ok("4.1 compact 成功后下一次输入重注入");
 
     await h.end();
-    assert.ok(!(await h.prompt()).systemPrompt.includes(HEADER), "一轮过后照样卸载");
+    assert.ok(!(await h.routed()).includes(HEADER), "一轮过后照样卸载");
     ok("4.2 compact 注入同样单次生效");
 
     await h.end();
     await h.compact();
     await h.input("第二次压缩后");
-    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "每次 compact 都要重新武装");
+    assert.ok((await h.routed("第二次压缩后")).includes(HEADER), "每次 compact 都要重新武装");
     ok("4.3 多次 compact 每次都重新武装");
 }
 
@@ -319,11 +334,11 @@ console.log("\n[Suite 7] 技能隔离与自愈");
 
     // 漏输出后重试一次；再漏就放开全部工具（普通 pi）
     await h2.input("第二问");
-    assert.ok((await h2.prompt()).systemPrompt.includes(HEADER), "漏输出后下一轮必须重试注入");
+    assert.ok((await h2.routed("第二问")).includes(HEADER), "漏输出后下一轮必须重试注入");
     await h2.reply("又忘了");
     await h2.end();
     await h2.input("第三问");
-    assert.ok(!(await h2.prompt()).systemPrompt.includes(HEADER), "只重试一次");
+    assert.ok(!(await h2.routed("第三问")).includes(HEADER), "只重试一次");
     assert.deepEqual([...h2.tools()].sort(), [...TOOLS].sort(), "放弃路由后放开全部工具");
     ok("7.3 漏输出重试一次，再漏放开全部工具");
 }
@@ -368,7 +383,7 @@ console.log("\n[Suite 9] compact 后会话重入");
     const h = harness({ entries: [userMsg("第一问"), { type: "compaction" }, saved()] });
     await h.start();
     await h.input("压缩后重入的第一句");
-    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "compact 后会话重入仍须注入");
+    assert.ok((await h.routed("压缩后重入的第一句")).includes(HEADER), "compact 后会话重入仍须注入");
     assert.ok(h.tools().includes("gdb-mcp_open"), "重入仍须恢复工具");
     ok("9.1 compact + session_start 再入 → 仍注入");
 
@@ -376,7 +391,7 @@ console.log("\n[Suite 9] compact 后会话重入");
     const h2 = harness({ entries: [userMsg("历史第一问"), saved()] });
     await h2.start();
     await h2.input("普通 resume");
-    assert.ok(!(await h2.prompt()).systemPrompt.includes(HEADER), "无压缩的 resume 不该注入");
+    assert.ok(!(await h2.routed("普通 resume")).includes(HEADER), "无压缩的 resume 不该注入");
     ok("9.2 无 compact 的 resume 不注入");
 
     // 9.3 压缩后又发过用户消息 → 注入机会已用掉，不得重复注入
@@ -385,21 +400,21 @@ console.log("\n[Suite 9] compact 后会话重入");
     });
     await h3.start();
     await h3.input("再下一句");
-    assert.ok(!(await h3.prompt()).systemPrompt.includes(HEADER), "压缩后的注入机会已消费");
+    assert.ok(!(await h3.routed("再下一句")).includes(HEADER), "压缩后的注入机会已消费");
     ok("9.3 压缩后已发过话 → 不注入");
 
     // 9.4 冷启动仍注入（userMsgCount === 0）
     const h4 = harness();
     await h4.start();
     await h4.input("全新会话");
-    assert.ok((await h4.prompt()).systemPrompt.includes(HEADER), "冷启动必须注入");
+    assert.ok((await h4.routed("全新会话")).includes(HEADER), "冷启动必须注入");
     ok("9.4 冷启动仍注入");
 
     // 9.5 只有历史、没存过状态、也没压缩 → 只 fallback，不注入
     const h5 = harness({ entries: [userMsg("旧会话第一问")] });
     await h5.start();
     await h5.input("继续");
-    assert.ok(!(await h5.prompt()).systemPrompt.includes(HEADER), "无状态历史不得注入");
+    assert.ok(!(await h5.routed("继续")).includes(HEADER), "无状态历史不得注入");
     ok("9.5 无状态历史不注入");
 }
 
@@ -438,7 +453,7 @@ console.log("\n[Suite 10] 后续轮次 topic 泄漏");
 // ==========================================
 console.log("\n[Suite 11] 能力池只列未激活项");
 {
-    // 池子是「表头行 + 若干 `  * name: desc` 行」，取整段
+    // 池子是「表头行 + 若干 `  * name: desc` 行」，取整段（现在在注入的用户消息里）
     const line = (sp, prefix) => {
         const lines = sp.split("\n");
         const i = lines.findIndex((l) => l.startsWith(prefix));
@@ -450,7 +465,7 @@ console.log("\n[Suite 11] 能力池只列未激活项");
     const h = harness();
     await h.start();
     await h.input("第一问");
-    const cold = (await h.prompt()).systemPrompt;
+    const cold = await h.routed("第一问");
     assert.ok(line(cold, "- Tools not yet active:").includes("gdb-mcp_open"), "冷启动：额外工具在池子里");
     assert.ok(line(cold, "- Skills not yet loaded:").includes("ponytail"), "冷启动：技能在池子里");
     assert.ok(line(cold, "- Skills not yet loaded:").includes("* ponytail: ponytail 说明"), "技能带作用描述");
@@ -460,7 +475,7 @@ console.log("\n[Suite 11] 能力池只列未激活项");
     await h.end();
     await h.compact();
     await h.input("压缩后继续");
-    const warm = (await h.prompt()).systemPrompt;
+    const warm = await h.routed("压缩后继续");
     assert.ok(!line(warm, "- Tools not yet active:").includes("gdb-mcp_open"), "已激活工具不得重复列出");
     assert.ok(!line(warm, "- Skills not yet loaded:").includes("ponytail"), "已加载技能不得重复列出");
     assert.ok(line(warm, "- Skills not yet loaded:").includes("deep-research"), "未加载技能仍应可选项");
@@ -508,7 +523,7 @@ console.log("\n[Suite 12] /topic update");
 
     await topic("update", h.ctx);
     await h.input("再来");
-    assert.ok((await h.prompt()).systemPrompt.includes(HEADER), "无参 update → 下一轮让模型重路由");
+    assert.ok((await h.routed("再来")).includes(HEADER), "无参 update → 下一轮让模型重路由");
     await h.reply("<topic><title>补充</title><description>加个调试</description><mode>code</mode><tools><tool>gdb-mcp_open</tool></tools></topic>");
     assert.ok(h.tools().includes("nu") && h.tools().includes("gdb-mcp_open"), "模型重路由是累加");
     ok("12.3 无参 update 触发模型重路由");

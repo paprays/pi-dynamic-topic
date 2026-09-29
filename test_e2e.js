@@ -325,14 +325,16 @@ console.log("  ✓ Lifecycle: Cold start activation passed");
 // 7.2 Turn 1 指令注入 system prompt（用户文本不被污染）
 const inputResult1 = await eventHandlers.get("input")({ text: "帮我用 gdb 排查这个 c++ 错误" }, mockCtx);
 assert.equal(inputResult1.action, "continue", "Turn 1 must NOT rewrite user text");
-const turn1Prompt = await eventHandlers.get("before_agent_start")(
-    { systemPrompt: "BASE_PROMPT" },
+await eventHandlers.get("before_agent_start")({ systemPrompt: "BASE_PROMPT" }, mockCtx);
+const turn1Ctx = await eventHandlers.get("context")(
+    { messages: [{ role: "user", content: "帮我用 gdb 排查这个 c++ 错误" }] },
     mockCtx
 );
-assert.ok(turn1Prompt.systemPrompt.includes("[Session Topic & Capability Routing (this turn ONLY)]"));
-assert.ok(turn1Prompt.systemPrompt.includes("gdb-mcp_open"));
-assert.ok(turn1Prompt.systemPrompt.startsWith("BASE_PROMPT"), "Isolate: 原 system prompt 必须保留在前");
-console.log("  ✓ Lifecycle: Turn 1 system-prompt injection passed");
+const turn1UserMsg = turn1Ctx.messages.find((m) => m.role === "user").content;
+assert.ok(turn1UserMsg.includes("[Session Topic & Capability Routing (this turn ONLY)]"));
+assert.ok(turn1UserMsg.includes("gdb-mcp_open"));
+assert.ok(turn1UserMsg.startsWith("帮我用 gdb"), "Isolate: 原用户文本必须保留在前");
+console.log("  ✓ Lifecycle: Turn 1 context-message injection passed");
 
 // 7.3 Assistant Message End with XML Response
 const assistantMsg = {
@@ -512,8 +514,10 @@ assert.ok(coerced.modes && typeof coerced.modes === "object");
         assert.ok(Array.isArray(h.tools()) && h.tools().length > 0, "baseTools must be applied");
         const r = await h.ev.get("input")({ text: "第一条消息" }, h.ctx);
         assert.equal(r.action, "continue", "input hook must not throw on a partial config");
-        const sp = await h.ev.get("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
-        assert.ok(sp.systemPrompt.includes("Capability Routing"), "partial config 仍须注入指令");
+        await h.ev.get("before_agent_start")({ systemPrompt: "BASE" }, h.ctx);
+        const ctxR = await h.ev.get("context")({ messages: [{ role: "user", content: "第一条消息" }] }, h.ctx);
+        const um = ctxR.messages.find((m) => m.role === "user").content;
+        assert.ok(um.includes("Capability Routing"), "partial config 仍须注入指令");
     } finally {
         process.chdir(prev);
         fs.rmSync(partialProj, { recursive: true, force: true });
@@ -629,7 +633,7 @@ console.log("  ✓ 8.7c Prose mention of `<topic>` before the real block");
     await h.ev.get("message_end")(reply("我忘了输出 topic 块"), h.ctx);
     await h.ev.get("agent_end")({}, h.ctx);
     const turn2 = await h.ev.get("before_agent_start")({ systemPrompt: SP }, h.ctx);
-    assert.ok(turn2.systemPrompt.includes("ponytail"), "skills must come back when routing never landed");
+    assert.ok((turn2?.systemPrompt ?? SP).includes("ponytail"), "skills must come back when routing never landed");
     fs.rmSync(skillDir, { recursive: true, force: true });
 }
 console.log("  ✓ 8.8 Skills recover when the model omits <topic>");

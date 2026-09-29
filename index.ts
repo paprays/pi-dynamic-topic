@@ -907,14 +907,16 @@ export default function (pi: ExtensionAPI) {
     });
 
     /**
-     * 协议指令的承载位：system prompt。
-     * 不能挂在用户消息上 —— 用户消息会永久留在会话历史里，模型每轮都看得见“输出 <topic>”
-     * 那条指令，于是从第二轮起持续重复输出。system prompt 是每轮重建的，
-     * expectingTopic 一落就自然卸载，历史里不留痕。
+     * 协议指令的承载位：context 事件里的最后一条用户消息。
+     *
+     * 不挂在 system prompt 上：claude-bridge 用 Claude Code 自带 preset 重建 prompt，
+     * 扩展从 before_agent_start 返回的 systemPrompt 会被 projectCapture 整段丢掉
+     * （bridge issue #135 探针表：before_agent_start→systemPrompt = 不到达；context = 到达）。
+     * context 事件每次 LLM 调用前触发，改的是发给模型的深拷贝副本，不写会话历史，
+     * 所以指令首轮可见、expectingTopic 一落就消失，也不会每轮泄漏。
      */
-    function buildTurnSystemPrompt(basePrompt: string): string {
-        if (!expectingTopic) return basePrompt;
-        // 池子里只放“还没挂上的”：已加载的工具/system prompt 里已有的技能重复列出，
+    function buildTurnInstruction(): string {
+        // 池子里只放“还没挂上的”：已加载的工具/已注入的技能重复列出，
         // 既浪费 token，也会诱使模型把它们再选一遍（对 tools 而言重复选择是无效动作）
         const activeTools = pi.getActiveTools();
         const extraTools = pi
@@ -922,20 +924,39 @@ export default function (pi: ExtensionAPI) {
             .filter((t) => !config.baseTools.includes(t.name) && !activeTools.includes(t.name))
             .map((t) => ({ name: t.name, description: t.description }));
         const availableSkills = knownSkills.filter((s) => !activeSkills.has(s.name.toLowerCase()));
-        const instruction = buildRoutingInstruction(extraTools, availableSkills, config.modes);
-        return `${basePrompt}\n\n${instruction}`;
+        return buildRoutingInstruction(extraTools, availableSkills, config.modes);
     }
 
     // 4. 发送给大模型前：过滤系统提示词，实现技能按需隔离
+    // 技能列表在 system prompt 的 <available_skills> 里，只能在这里过滤。
+    // bridge 下这段 systemPrompt 被丢，技能收窄不生效（bridge 自己重渲染技能列表），
+    // 这是 bridge 的结构限制，无法在扩展侧修复；工具收窄和路由指令走别的路。
     pi.on("before_agent_start", async (event) => {
         knownSkills = parseAvailableSkills(event.systemPrompt);
         // 只在「等待路由」或「路由已落地」时过滤技能。
         // 模型漏输出 <topic> 时两者皆假，原样放行，避免技能整个会话消失且无自愈
-        let systemPrompt = buildTurnSystemPrompt(event.systemPrompt);
         if (expectingTopic || routingApplied) {
-            systemPrompt = filterSystemPromptSkills(systemPrompt, activeSkills);
+            return { systemPrompt: filterSystemPromptSkills(event.systemPrompt, activeSkills) };
         }
-        return { systemPrompt };
+    });
+
+    // 4b. 每次 LLM 调用前：等待路由时把协议指令追加到最后一条用户消息
+    pi.on("context", async (event) => {
+        if (!expectingTopic) return;
+        const messages = event.messages;
+        for (let i = messages.length - 1; i >= 0; i--) {
+            const m: any = messages[i];
+            if (m.role !== "user") continue;
+            const instruction = buildTurnInstruction();
+            if (typeof m.content === "string") {
+                m.content = `${m.content}\n\n${instruction}`;
+            } else if (Array.isArray(m.content)) {
+                m.content = [...m.content, { type: "text", text: instruction }];
+            } else {
+                continue;
+            }
+            return { messages };
+        }
     });
 
     // 5. 模型回复结束：解析 XML 并动态调整工具与技能
