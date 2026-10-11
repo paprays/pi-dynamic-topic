@@ -341,6 +341,19 @@ console.log("\n[Suite 7] 技能隔离与自愈");
     assert.ok(!(await h2.routed("第三问")).includes(HEADER), "只重试一次");
     assert.deepEqual([...h2.tools()].sort(), [...TOOLS].sort(), "放弃路由后放开全部工具");
     ok("7.3 漏输出重试一次，再漏放开全部工具");
+
+    // 报错/中断的轮次不消耗重试；「继续」不能把标签改成「新对话」
+    const h3 = harness();
+    await h3.start();
+    await h3.input("k9s 格式错误，怎么办");
+    for (const stopReason of ["error", "aborted"]) {
+        await h3.ev.get("message_end")({ message: { role: "assistant", stopReason, content: [] } }, h3.ctx);
+        await h3.end();
+        await h3.input("继续");
+        assert.ok((await h3.routed("继续")).includes(HEADER), `${stopReason} 轮次后必须重新注入`);
+    }
+    assert.ok(!h3.titles.includes("新对话"), "短句不覆盖预览标题");
+    ok("7.4 报错/中断不消耗重试，短句不覆盖标题");
 }
 
 // ==========================================

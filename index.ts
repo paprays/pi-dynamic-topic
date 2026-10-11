@@ -771,6 +771,8 @@ export default function (pi: ExtensionAPI) {
     let routingApplied = false;
     // 漏输出只重试一次，再漏就退化成普通 pi
     let routingRetried = false;
+    // 报错/中断的轮次不算模型漏输出，不消耗重试次数
+    let lastStopReason: string | undefined;
     let config: DynamicTopicConfig = coerceConfig(DEFAULT_CONFIG);
     // pi 实际加载的技能集，每轮从 system prompt 里读
     let knownSkills: SkillInfo[] = [];
@@ -898,9 +900,12 @@ export default function (pi: ExtensionAPI) {
             shouldInjectInNextPrompt = false;
             expectingTopic = true;
 
+            // 「继续」这类短句没有主题信息，别用「新对话」盖掉上一轮的预览
             const preview = generateFallbackTopic(event.text);
-            setTerminalTitle(ctx, preview);
-            sendHerdrTabRename(preview);
+            if (preview !== "新对话") {
+                setTerminalTitle(ctx, preview);
+                sendHerdrTabRename(preview);
+            }
         }
 
         return { action: "continue" };
@@ -965,6 +970,7 @@ export default function (pi: ExtensionAPI) {
     // 又让模型从自己的历史里学到「每轮都该输出」，把泄漏自我强化下去。
     pi.on("message_end", async (event, ctx) => {
         if (event.message.role !== "assistant") return;
+        lastStopReason = (event.message as any).stopReason;
         if (!Array.isArray(event.message.content)) return;
 
         let parsedBlock: ParsedTopicBlock | null = null;
@@ -1000,7 +1006,9 @@ export default function (pi: ExtensionAPI) {
     // 6. Agent 单轮结束：漏输出 <topic> 时重试一次，再漏就放开全部工具（普通 pi）
     pi.on("agent_end", async () => {
         if (expectingTopic && !routingApplied) {
-            if (!routingRetried) {
+            if (lastStopReason === "error" || lastStopReason === "aborted") {
+                shouldInjectInNextPrompt = true;
+            } else if (!routingRetried) {
                 routingRetried = true;
                 shouldInjectInNextPrompt = true;
             } else {
