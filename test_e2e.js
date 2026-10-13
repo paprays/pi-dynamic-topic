@@ -284,6 +284,7 @@ const mockCtx = {
             notifiedMessages.push({ msg, level });
         },
         setTitle: () => {},
+        setStatus: () => {},
     },
     model: { id: "test-model" },
     modelRegistry: {
@@ -459,7 +460,7 @@ function regHarness(cwd) {
     const ctx = {
         cwd,
         sessionManager: { getEntries: () => [] },
-        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t) },
+        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t), setStatus: () => {} },
         model: { id: "m" },
         modelRegistry: { complete: async () => ({ role: "assistant", content: [] }) },
     };

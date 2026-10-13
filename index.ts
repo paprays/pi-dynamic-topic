@@ -822,6 +822,8 @@ export default function (pi: ExtensionAPI) {
         }
 
         setTerminalTitle(ctx, topic);
+        // 常驻显示当前模式：notify 只在路由落地时弹一次，resume/reload 后就看不到了
+        ctx.ui.setStatus("dynamic-topic", `🎯 ${currentMode}`);
         sendHerdrTabRename(topic);
 
         if (notify) {

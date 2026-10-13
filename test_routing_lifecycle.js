@@ -51,6 +51,7 @@ function harness({ entries = [] } = {}) {
     const notes = [];
     const titles = [];
     const appended = [];
+    const status = {};
     ext({
         getAllTools: () => TOOLS.map((name) => ({ name })),
         getActiveTools: () => tools,
@@ -64,7 +65,7 @@ function harness({ entries = [] } = {}) {
     });
     const ctx = {
         sessionManager: { getEntries: () => entries },
-        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t) },
+        ui: { notify: (msg, level) => notes.push({ msg, level }), setTitle: (t) => titles.push(t), setStatus: (k, t) => (status[k] = t) },
         model: { id: "test-model" },
         modelRegistry: { complete: async () => ({ role: "assistant", content: [] }) },
     };
@@ -74,6 +75,7 @@ function harness({ entries = [] } = {}) {
         notes,
         titles,
         appended,
+        status,
         ctx,
         tools: () => tools,
         start: () => ev.get("session_start")({}, ctx),
@@ -289,6 +291,7 @@ console.log("\n[Suite 6] resume / fork");
     // 回归：恢复分支曾每次 resume 都再写一条相同的 state entry（实测一个会话堆了 39 条）
     assert.equal(h.appended.length, 0, "resume 不得重复落库");
     assert.equal(h.titles.at(-1), "[调试 - 排查段错误]", "resume 恢复标题");
+    assert.equal(h.status["dynamic-topic"], "🎯 code", "resume 后状态栏必须显示模式");
     ok("6.2 resume 不重复落库");
 
     // 回归：装插件前的旧会话曾被 applyTopic 清空技能、压回 baseTools，且不再路由
